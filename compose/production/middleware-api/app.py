@@ -414,7 +414,6 @@ def create_app():
                 affectedEntities
                 cvssScore
                 cvssVector
-                findingGuidance
                 extraFields
                 severityId
                 findingTypeId
