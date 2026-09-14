@@ -251,6 +251,8 @@ services:
       - django
     labels:
       name: ghostwriter_middleware_api
+    volumes:
+      - ./ssl:/ssl
     ports:
       - "0.0.0.0:8443:8443"
     environment:
