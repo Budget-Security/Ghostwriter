@@ -1,4 +1,5 @@
 # Standard Libraries
+import base64
 import io
 import json
 import logging
@@ -20,6 +21,8 @@ from django.utils.dateformat import format as dateformat
 from django.utils.encoding import force_str
 
 # 3rd Party Libraries
+import pptx
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from rest_framework.renderers import JSONRenderer
 
 # Ghostwriter Libraries
@@ -3034,6 +3037,27 @@ class ReportFindingLinkUpdateViewTests(TestCase):
         self.assertContains(response, "Finding Guidance")
         self.assertNotContains(response, 'class="finding-accordion mb-3"')
 
+    def test_back_to_report_uses_parent_without_changing_working_report(self):
+        ProjectAssignmentFactory(project=self.report.project, operator=self.user)
+        other_report = ReportFactory(project=self.report.project)
+        return_url = reverse("reporting:report_detail", kwargs={"pk": self.report.pk})
+        for client in (self.client_mgr, self.client_auth):
+            for active_report in (
+                None,
+                {"id": other_report.pk, "title": other_report.title},
+            ):
+                with self.subTest(user=client, active_report=active_report):
+                    session = client.session
+                    session["active_report"] = active_report
+                    session.save()
+
+                    response = client.get(self.uri)
+
+                    self.assertContains(response, f'href="{return_url}#findings"')
+                    self.assertContains(response, "Back to report", count=1)
+                    self.assertEqual(client.session["active_report"], active_report)
+                    self.assertEqual(response.context["pinned_work"], [])
+
     def test_view_uses_versioned_collaboration_assets(self):
         response = self.client_mgr.get(self.uri)
 
@@ -3160,6 +3184,27 @@ class ReportObservationLinkUpdateViewTests(TestCase):
             response, "reporting/report_observation_link_update.html"
         )
 
+    def test_back_to_report_uses_parent_without_changing_working_report(self):
+        ProjectAssignmentFactory(project=self.report.project, operator=self.user)
+        other_report = ReportFactory(project=self.report.project)
+        return_url = reverse("reporting:report_detail", kwargs={"pk": self.report.pk})
+        for client in (self.client_mgr, self.client_auth):
+            for active_report in (
+                None,
+                {"id": other_report.pk, "title": other_report.title},
+            ):
+                with self.subTest(user=client, active_report=active_report):
+                    session = client.session
+                    session["active_report"] = active_report
+                    session.save()
+
+                    response = client.get(self.uri)
+
+                    self.assertContains(response, f'href="{return_url}#observations"')
+                    self.assertContains(response, "Back to report", count=1)
+                    self.assertEqual(client.session["active_report"], active_report)
+                    self.assertEqual(response.context["pinned_work"], [])
+
     def test_view_renders_numeric_evidence_report_id(self):
         response = self.client_mgr.get(self.uri)
         self.assertEqual(response.status_code, 200)
@@ -3238,6 +3283,29 @@ class ReportExtraFieldEditViewTests(TestCase):
         response = self.client_mgr.get(self.uri)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "reporting/report_update_extra_field.html")
+        self.assertContains(response, 'class="report-field-workspace"')
+        self.assertContains(response, "js/page-sticky-offset.js")
+
+    def test_back_to_report_uses_parent_without_changing_working_report(self):
+        ProjectAssignmentFactory(project=self.report.project, operator=self.user)
+        other_report = ReportFactory(project=self.report.project)
+        return_url = reverse("reporting:report_detail", kwargs={"pk": self.report.pk})
+        for client in (self.client_mgr, self.client_auth):
+            for active_report in (
+                None,
+                {"id": other_report.pk, "title": other_report.title},
+            ):
+                with self.subTest(user=client, active_report=active_report):
+                    session = client.session
+                    session["active_report"] = active_report
+                    session.save()
+
+                    response = client.get(self.uri)
+
+                    self.assertContains(response, f'href="{return_url}#extra-fields"')
+                    self.assertContains(response, "Back to report", count=1)
+                    self.assertEqual(client.session["active_report"], active_report)
+                    self.assertEqual(response.context["pinned_work"], [])
 
     def test_view_renders_numeric_evidence_report_id(self):
         response = self.client_mgr.get(self.uri)
@@ -5797,6 +5865,90 @@ class GenerateReportTests(TestCase):
             repr(response)
             + repr([str(msg) for msg in get_messages(response.wsgi_request)]),
         )
+
+    def test_view_pptx_includes_editor_evidence_node(self):
+        self.assert_pptx_includes_evidence("description")
+
+    def test_view_pptx_includes_evidence_from_supporting_sections(self):
+        for field in (
+            "affected_entities",
+            "impact",
+            "mitigation",
+            "replication_steps",
+            "host_detection_techniques",
+            "network_detection_techniques",
+            "references",
+        ):
+            with self.subTest(field=field):
+                self.assert_pptx_includes_evidence(field)
+
+    def test_view_pptx_includes_legacy_evidence_from_supporting_section(self):
+        self.assert_pptx_includes_evidence("replication_steps", legacy=True)
+
+    def test_view_pptx_includes_evidence_from_rich_text_extra_field(self):
+        field_model, _ = ExtraFieldModel.objects.get_or_create(
+            model_internal_name="reporting.Finding",
+            defaults={"model_display_name": "Findings"},
+        )
+        ExtraFieldSpecFactory(
+            internal_name="evidence_notes",
+            type="rich_text",
+            target_model=field_model,
+        )
+        self.assert_pptx_includes_evidence("evidence_notes", extra=True)
+
+    def assert_pptx_includes_evidence(self, field, legacy=False, extra=False):
+        """Verify downloaded media and keep supporting prose in the slide notes."""
+        image_contents = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+yF9kAAAAASUVORK5CYII="
+        )
+        evidence = EvidenceFactory(
+            report=self.report,
+            document=SimpleUploadedFile(
+                "pptx-evidence.png",
+                image_contents,
+                content_type="image/png",
+            ),
+        )
+        marker = (
+            f"{{{{.{evidence.friendly_name}}}}}"
+            if legacy
+            else f'<div class="richtext-evidence" data-evidence-id="{evidence.pk}"></div>'
+        )
+        content = f"<p>Evidence section prose</p>{marker}"
+        fields = {"extra_fields": {field: content}} if extra else {field: content}
+        finding = ReportFindingLinkFactory(
+            report=self.report,
+            title="Finding with PPTX evidence",
+            **fields,
+        )
+
+        response = self.client_mgr.get(self.pptx_uri)
+
+        self.assertEqual(response.status_code, 200, response.content)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as presentation:
+            embedded_media = [
+                presentation.read(name)
+                for name in presentation.namelist()
+                if name.startswith("ppt/media/")
+            ]
+        self.assertIn(image_contents, embedded_media)
+        deck = pptx.Presentation(io.BytesIO(response.content))
+        slide = next(
+            s for s in deck.slides if s.shapes.title.text.startswith(finding.title)
+        )
+        pictures = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        self.assertEqual(len(pictures), 1)
+        if field != "description":
+            self.assertNotIn(
+                "Evidence section prose",
+                "\n".join(s.text for s in slide.shapes if s.has_text_frame),
+            )
+            if not extra:
+                self.assertIn(
+                    "Evidence section prose", slide.notes_slide.notes_text_frame.text
+                )
+        finding.delete()
 
     def test_view_all_uri_exists_at_desired_location(self):
         response = self.client_mgr.get(self.all_uri)
