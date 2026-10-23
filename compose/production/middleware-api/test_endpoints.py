@@ -450,6 +450,78 @@ def test_get_project_queries_report_scoped_evidence(client, stub):
     assert evidence_at < findings_at, "evidence must be selected on the report, not the finding"
 
 
+def test_get_project_does_not_select_finding_guidance(client, stub):
+    """
+    Finding guidance is the tester's note to the report writer (internal ids, evidence
+    paths) and must never reach the portal. Removed in 07e4bb20; this keeps it out.
+    """
+    stub.routes = _get_project_routes({"showResultsInDashboard": True})
+    call(client, "get", "/getProject?projectId=1")
+    query = stub.queries_matching("GetProject")[0]["query"]
+    assert "findingGuidance" not in query
+
+
+C4_MODEL = {"generated": "2026-10-23T07:48:22Z", "model": {"views": {"index": {}}}, "elements": {}, "views": []}
+
+
+def _project_with_extra_fields(client_extra, report_extra, finding_extra):
+    payload = _project_payload(client_extra)
+    report = payload["project_by_pk"]["reports"][0]
+    report["extraFields"] = report_extra
+    report["findings"][0]["extraFields"] = finding_extra
+    return {"GetProject": payload, "downloadEvidence": _get_project_routes(client_extra)["downloadEvidence"]}
+
+
+def test_get_project_lifts_mitigation_prompt_and_c4_model(client, stub):
+    stub.routes = _project_with_extra_fields(
+        {"showResultsInDashboard": True},
+        {"c4_model": C4_MODEL, "other": "keep"},
+        {"mitigation_prompt": "# Fix: SQLi\n\nUse bound parameters.", "poc": "keep"},
+    )
+    report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
+    assert report["c4Model"] == C4_MODEL
+    assert report["findings"][0]["mitigationPrompt"] == "# Fix: SQLi\n\nUse bound parameters."
+    # Carried once: the raw copies leave extraFields, everything else stays.
+    assert report["extraFields"] == {"other": "keep"}
+    assert report["findings"][0]["extraFields"] == {"poc": "keep"}
+
+
+@pytest.mark.parametrize("report_extra,finding_extra", [
+    (None, None),
+    ({}, {}),
+    ({"c4_model": None}, {"mitigation_prompt": None}),
+    ({"c4_model": {}}, {"mitigation_prompt": ""}),  # saved empty
+    ({"c4_model": "not json"}, {"mitigation_prompt": "   "}),
+    ({"c4_model": ["a list"]}, {"mitigation_prompt": 42}),
+], ids=["null-extrafields", "keys-absent", "null", "empty", "garbage", "wrong-type"])
+def test_get_project_unset_extra_fields_are_null(client, stub, report_extra, finding_extra):
+    """Every way of not having a value reads as null, never as {} or a blank string."""
+    stub.routes = _project_with_extra_fields({"showResultsInDashboard": True}, report_extra, finding_extra)
+    report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
+    assert report["c4Model"] is None
+    assert report["findings"][0]["mitigationPrompt"] is None
+
+
+def test_get_project_parses_c4_model_written_as_json_text(client, stub):
+    import json
+    stub.routes = _project_with_extra_fields(
+        {"showResultsInDashboard": True}, {"c4_model": json.dumps(C4_MODEL)}, {}
+    )
+    report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
+    assert report["c4Model"] == C4_MODEL
+
+
+def test_get_project_hides_c4_model_when_flag_not_true(client, stub):
+    """The model maps systems to findings, so it is finding detail and follows the flag."""
+    stub.routes = _project_with_extra_fields(
+        {"showResultsInDashboard": False}, {"c4_model": C4_MODEL}, {"mitigation_prompt": "x"}
+    )
+    report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
+    assert report["c4Model"] is None
+    assert "c4_model" not in report["extraFields"]
+    assert report["findings"] == []
+
+
 def test_get_project_graphql_error_is_502(client, stub):
     stub.routes = {"GetProject": FakeResponse(status_code=500, text="nope")}
     resp = call(client, "get", "/getProject?projectId=1")

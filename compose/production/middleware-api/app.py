@@ -25,6 +25,11 @@ POC_DEFAULT_ATTACHMENT_NAME = "poc.py"
 POC_DEFAULT_MEM_MB = 256
 POC_DEFAULT_CPU = 0.5
 
+# Extra fields /getProject lifts out of `extraFields` into fields of their own, for the
+# customer portal's VMS view. Internal names as configured in Ghostwriter's admin panel.
+FINDING_MITIGATION_PROMPT_FIELD = "mitigation_prompt"  # Finding, text: a fix prompt for an AI coding tool
+REPORT_C4_MODEL_FIELD = "c4_model"  # Report, JSON: the client-facing projection of the C4 model
+
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -61,6 +66,47 @@ def parse_poc_manifest(raw):
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+def mitigation_prompt_from(extra_fields):
+    """
+    Read a finding's ``mitigation_prompt`` extra field: the finding written as a task
+    for the customer's AI coding tool. It is plain text and is returned as stored.
+    Returns ``None`` when it is unset, blank or not text.
+    """
+    value = (extra_fields or {}).get(FINDING_MITIGATION_PROMPT_FIELD)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
+
+
+def c4_model_from(extra_fields):
+    """
+    Read a report's ``c4_model`` JSON extra field: the C4 model as projected for the
+    customer. A JSON extra field that was never written is ``null``, and ``{}`` when
+    it was saved empty; both return ``None``. A JSON string (the field written through
+    the API as text) is parsed. Anything that is not a non-empty object returns ``None``.
+    """
+    value = (extra_fields or {}).get(REPORT_C4_MODEL_FIELD)
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, dict) or not value:
+        return None
+    return value
+
+
+def lift_extra_field(item, key, field_name, value):
+    """
+    Set ``item[key]`` to ``value`` and drop the raw ``field_name`` from the item's
+    ``extraFields``, so the response carries it once (a C4 model is ~170 kB).
+    """
+    item[key] = value
+    extra_fields = item.get("extraFields")
+    if isinstance(extra_fields, dict):
+        extra_fields.pop(field_name, None)
 
 
 def resolve_and_validate_inputs(params, provided):
@@ -622,11 +668,24 @@ def create_app():
 
             for report in project_data.get("reports", []):
                 if not show_results:
-                    # Evidence is finding detail too, so drop it without downloading the
-                    # blobs - that loop costs one request per evidence item.
+                    # Evidence and the C4 model (which maps systems to findings) are finding
+                    # detail too. Drop the evidence without downloading the blobs - that loop
+                    # costs one request per evidence item.
                     report["findings"] = []
                     report["evidence"] = []
+                    lift_extra_field(report, "c4Model", REPORT_C4_MODEL_FIELD, None)
                     continue
+
+                lift_extra_field(
+                    report, "c4Model", REPORT_C4_MODEL_FIELD, c4_model_from(report.get("extraFields"))
+                )
+                for finding in report.get("findings", []):
+                    lift_extra_field(
+                        finding,
+                        "mitigationPrompt",
+                        FINDING_MITIGATION_PROMPT_FIELD,
+                        mitigation_prompt_from(finding.get("extraFields")),
+                    )
 
                 evidence_list = report.get("evidence", [])
                 downloaded = []
