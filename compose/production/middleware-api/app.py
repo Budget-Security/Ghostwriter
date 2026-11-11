@@ -754,6 +754,7 @@ def create_app():
         """
         The findings of several projects in one call, without the text fields, evidence
         or C4 model /getProject carries: what a findings list or a severity count needs.
+        ``hasC4Model`` says whether a report holds a C4 model (false while results are hidden).
         Same gating as /getProject: a client without showResultsInDashboard gets no
         findings. Projects that do not exist are left out of the response.
         """
@@ -784,6 +785,7 @@ def create_app():
             }
             reports(where: {title: {_neq: "Original Findings"}}) {
               id
+              c4Model: extraFields(path: "c4_model")
               findings(order_by: {cvssScore: desc}) {
                 id
                 title
@@ -809,6 +811,11 @@ def create_app():
         for project in (data or {}).get("project") or []:
             show = shows_results(project.get("client"))
             findings = []
+            # Whether a report carries a C4 model (the attack map), without sending the model.
+            has_c4_model = show and any(
+                c4_model_from({REPORT_C4_MODEL_FIELD: report.get("c4Model")})
+                for report in project.get("reports") or []
+            )
             if show:
                 for report in project.get("reports") or []:
                     for finding in report.get("findings") or []:
@@ -829,6 +836,7 @@ def create_app():
                 "codename": project.get("codename"),
                 "complete": project.get("complete"),
                 "showResults": show,
+                "hasC4Model": bool(has_c4_model),
                 "findings": findings,
             })
         return jsonify({"projects": projects})
