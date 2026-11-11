@@ -1,0 +1,155 @@
+{
+  "project_by_pk": {
+    "client": {
+      "extraFields": {
+        "showResultsInDashboard": true
+      },
+      "id": 9,
+      "name": "World Co",
+      "shortName": "WORLD"
+    },
+    "clientId": 9,
+    "codename": "BLUE HERON",
+    "collab_note": "",
+    "complete": true,
+    "description": "Web application test",
+    "endDate": "2026-10-10",
+    "endTime": "17:00:00",
+    "extraFields": {},
+    "id": 55555,
+    "operatorId": null,
+    "projectType": {
+      "id": 2,
+      "projectType": "Web Application"
+    },
+    "projectTypeId": 2,
+    "reports": [
+      {
+        "archived": false,
+        "c4Model": {
+          "all_views": [
+            {
+              "id": "index",
+              "label": "Overview",
+              "title": "Overview",
+              "walkthrough": false
+            }
+          ],
+          "elements": {
+            "app": {
+              "findings": [
+                {
+                  "access": "No account needed",
+                  "attacker": "unauth",
+                  "category": "A05:2025-Injection",
+                  "confidence": "Confirmed",
+                  "cwe": "CWE-89",
+                  "endpoint": "/search",
+                  "gw_id": 31,
+                  "needs_click": false,
+                  "severity": "critical",
+                  "status": "open"
+                }
+              ],
+              "unreported": 0,
+              "unreported_by_severity": {}
+            }
+          },
+          "generated": "2026-10-10T12:00:00Z",
+          "model": {
+            "views": {
+              "index": {
+                "edges": [],
+                "id": "index",
+                "nodes": [],
+                "title": "Overview"
+              }
+            }
+          },
+          "views": [
+            {
+              "id": "index",
+              "label": "Overview"
+            }
+          ]
+        },
+        "complete": true,
+        "creation": "2026-10-10",
+        "delivered": true,
+        "evidence": [
+          {
+            "evidenceId": 77,
+            "fileBase64": "iVBORw0KGgo=",
+            "filename": "search.png",
+            "friendlyName": "Search request"
+          }
+        ],
+        "extraFields": {},
+        "findings": [
+          {
+            "affectedEntities": "<p>GET /search</p>",
+            "complete": true,
+            "cvssScore": 9.8,
+            "cvssVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "description": "<p>The search endpoint concatenates input into SQL.</p><div class=\"richtext-evidence\" data-evidence-id=\"77\"></div>",
+            "extraFields": {},
+            "findingType": {
+              "findingType": "Web",
+              "id": 1
+            },
+            "findingTypeId": 1,
+            "id": 31,
+            "impact": "<p>Full read access to the database.</p>",
+            "mitigation": "<p>Use bound parameters.</p>",
+            "mitigationPrompt": "# Fix: SQL injection in search\n\nUse bound parameters in the search query.",
+            "position": 1,
+            "references": "<p>OWASP SQL Injection</p>",
+            "replication_steps": "<p>GET /search?q=' OR '1'='1</p>",
+            "severity": {
+              "id": 1,
+              "severity": "Critical",
+              "weight": 1
+            },
+            "severityId": 1,
+            "title": "SQL injection in search"
+          },
+          {
+            "affectedEntities": "",
+            "complete": true,
+            "cvssScore": 3.1,
+            "cvssVector": "",
+            "description": "<p>No Content-Security-Policy header.</p>",
+            "extraFields": {},
+            "findingType": {
+              "findingType": "Web",
+              "id": 1
+            },
+            "findingTypeId": 1,
+            "id": 32,
+            "impact": "<p>Raises the impact of XSS.</p>",
+            "mitigation": "<p>Send a CSP.</p>",
+            "mitigationPrompt": null,
+            "position": 2,
+            "references": "",
+            "replication_steps": "",
+            "severity": {
+              "id": 4,
+              "severity": "Low",
+              "weight": 4
+            },
+            "severityId": 4,
+            "title": "Missing security headers"
+          }
+        ],
+        "id": 5,
+        "last_update": "2026-10-11",
+        "projectId": 55555,
+        "title": "Web application test report"
+      }
+    ],
+    "slackChannel": "",
+    "startDate": "2026-10-01",
+    "startTime": "09:00:00",
+    "timezone": "Europe/Amsterdam"
+  }
+}
