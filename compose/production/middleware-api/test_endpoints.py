@@ -602,6 +602,7 @@ def test_get_finding_summaries_returns_lean_findings(client, stub):
     assert stub.variables_for("FindingSummaries") == {"projectIds": [1, 2]}
     project = resp.get_json()["projects"][0]
     assert project["id"] == 1 and project["codename"] == "BLUE" and project["showResults"] is True
+    assert project["hasC4Model"] is False
     first, second = project["findings"]
     assert first == {
         "id": 31, "reportId": 5, "title": "SQLi", "summary": "The search endpoint concatenates input.",
@@ -628,11 +629,37 @@ def test_get_finding_summaries_cuts_long_descriptions(client, stub):
     assert summary.endswith("…")
 
 
+@pytest.mark.parametrize("c4, expected", [
+    ({"views": []}, True),
+    ('{"views": []}', True),
+    ({}, False),
+    (None, False),
+], ids=["object", "json-text", "empty", "unset"])
+def test_get_finding_summaries_reports_whether_a_c4_model_exists(client, stub, c4, expected):
+    payload = _summaries_payload({"showResultsInDashboard": True})
+    payload["project"][0]["reports"][0]["c4Model"] = c4
+    stub.routes = {"FindingSummaries": payload}
+    project = call(client, "get", "/getFindingSummaries?projectIds=1").get_json()["projects"][0]
+    assert project["hasC4Model"] is expected
+    assert "c4Model" not in project and "views" not in str(project)
+
+
+def test_get_finding_summaries_selects_only_the_c4_model_path(client, stub):
+    stub.routes = {"FindingSummaries": _summaries_payload({"showResultsInDashboard": True})}
+    call(client, "get", "/getFindingSummaries?projectIds=1")
+    query = stub.queries_matching("FindingSummaries")[0]["query"]
+    assert 'extraFields(path: "c4_model")' in query
+
+
 @pytest.mark.parametrize("extra_fields", [{"showResultsInDashboard": False}, {}, None, {"showResultsInDashboard": "true"}])
 def test_get_finding_summaries_hides_findings_when_flag_not_true(client, stub, extra_fields):
     stub.routes = {"FindingSummaries": _summaries_payload(extra_fields)}
+    payload = _summaries_payload(extra_fields)
+    payload["project"][0]["reports"][0]["c4Model"] = {"views": []}
+    stub.routes = {"FindingSummaries": payload}
     project = call(client, "get", "/getFindingSummaries?projectIds=1").get_json()["projects"][0]
     assert project["showResults"] is False
+    assert project["hasC4Model"] is False
     assert project["findings"] == []
     assert project["codename"] == "BLUE"
 
