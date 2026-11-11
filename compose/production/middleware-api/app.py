@@ -109,6 +109,41 @@ def lift_extra_field(item, key, field_name, value):
         extra_fields.pop(field_name, None)
 
 
+def evidence_metadata(evidence):
+    """
+    An evidence item without its file: ``evidenceId``, ``filename`` (the stored file's
+    base name) and ``friendlyName``, the keys ``downloadEvidence`` uses.
+    """
+    document = evidence.get("document") or ""
+    return {
+        "evidenceId": evidence.get("id"),
+        "filename": document.rsplit("/", 1)[-1] or None,
+        "friendlyName": evidence.get("friendlyName"),
+    }
+
+
+# Length of the plain-text excerpt /getFindingSummaries returns for a description.
+FINDING_SUMMARY_CHARS = 300
+
+
+def summary_text(html):
+    """A finding description as plain text, whitespace collapsed, cut to FINDING_SUMMARY_CHARS."""
+    if not isinstance(html, str) or not html.strip():
+        return ""
+    text = " ".join(BeautifulSoup(html, "html.parser").get_text(separator=" ").split())
+    if len(text) > FINDING_SUMMARY_CHARS:
+        text = text[: FINDING_SUMMARY_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def shows_results(client):
+    """
+    The client's ``showResultsInDashboard`` extra field gates finding detail. An absent
+    key reads as false, matching the checkbox's empty value and /getStatistics.
+    """
+    return ((client or {}).get("extraFields") or {}).get("showResultsInDashboard") is True
+
+
 def resolve_and_validate_inputs(params, provided):
     """
     Merge caller-supplied inputs over the manifest parameter defaults and validate
@@ -570,6 +605,12 @@ def create_app():
         project_id, error = parse_int(project_id, "projectId")
         if error:
             return jsonify(error), 400
+        # evidence=inline (default) downloads every evidence file into the response;
+        # evidence=none returns each item's id, filename and friendly name only, for
+        # callers that fetch files one at a time through /getEvidence.
+        evidence_mode = (request.args.get("evidence") or body.get("evidence") or "inline").strip().lower()
+        if evidence_mode not in ("inline", "none"):
+            return jsonify({"error": "evidence must be inline or none"}), 400
 
         query = """
         query GetProject($projectId: bigint!) {
@@ -611,6 +652,8 @@ def create_app():
               extraFields
               evidence {
                 id
+                friendlyName
+                document
               }
               findings(order_by: {cvssScore: desc}) {
                 id
@@ -688,6 +731,9 @@ def create_app():
                     )
 
                 evidence_list = report.get("evidence", [])
+                if evidence_mode == "none":
+                    report["evidence"] = [evidence_metadata(ev) for ev in evidence_list]
+                    continue
                 downloaded = []
                 for ev in evidence_list:
                     ev_data, ev_err = graphql_request(download_query, {"evidenceId": int(ev["id"])})
@@ -698,6 +744,157 @@ def create_app():
                 report["evidence"] = downloaded
 
         return jsonify(data)
+
+    # Upper bound on projectIds per /getFindingSummaries call.
+    max_summary_projects = 200
+
+    @app.route("/getFindingSummaries", methods=["GET"])
+    @require_api_key
+    def get_finding_summaries():
+        """
+        The findings of several projects in one call, without the text fields, evidence
+        or C4 model /getProject carries: what a findings list or a severity count needs.
+        Same gating as /getProject: a client without showResultsInDashboard gets no
+        findings. Projects that do not exist are left out of the response.
+        """
+        body = request.get_json(silent=True) or {}
+        raw = request.args.get("projectIds") or body.get("projectIds")
+        if raw is None or raw == "" or raw == []:
+            return jsonify({"error": "projectIds is required"}), 400
+        parts = raw if isinstance(raw, list) else str(raw).split(",")
+        project_ids = []
+        for part in parts:
+            value, error = parse_int(str(part).strip(), "projectIds")
+            if error:
+                return jsonify({"error": "projectIds must be a comma-separated list of integers"}), 400
+            if value not in project_ids:
+                project_ids.append(value)
+        if len(project_ids) > max_summary_projects:
+            return jsonify({"error": f"at most {max_summary_projects} projectIds per call"}), 400
+
+        query = """
+        query FindingSummaries($projectIds: [bigint!]!) {
+          project(where: { id: { _in: $projectIds } }) {
+            id
+            codename
+            complete
+            client {
+              id
+              extraFields
+            }
+            reports(where: {title: {_neq: "Original Findings"}}) {
+              id
+              findings(order_by: {cvssScore: desc}) {
+                id
+                title
+                description
+                position
+                complete
+                cvssScore
+                severity {
+                  severity
+                  weight
+                }
+              }
+            }
+          }
+        }
+        """
+
+        data, error = graphql_request(query, {"projectIds": project_ids})
+        if error:
+            return jsonify({"error": error}), 502
+
+        projects = []
+        for project in (data or {}).get("project") or []:
+            show = shows_results(project.get("client"))
+            findings = []
+            if show:
+                for report in project.get("reports") or []:
+                    for finding in report.get("findings") or []:
+                        severity = finding.get("severity") or {}
+                        findings.append({
+                            "id": finding.get("id"),
+                            "reportId": report.get("id"),
+                            "title": finding.get("title"),
+                            "summary": summary_text(finding.get("description")),
+                            "position": finding.get("position"),
+                            "complete": bool(finding.get("complete")),
+                            "cvssScore": finding.get("cvssScore"),
+                            "severity": severity.get("severity"),
+                            "severityWeight": severity.get("weight"),
+                        })
+            projects.append({
+                "id": project.get("id"),
+                "codename": project.get("codename"),
+                "complete": project.get("complete"),
+                "showResults": show,
+                "findings": findings,
+            })
+        return jsonify({"projects": projects})
+
+    @app.route("/getEvidence", methods=["GET"])
+    @require_api_key
+    def get_evidence():
+        """
+        One evidence file, for callers that list evidence with /getProject?evidence=none.
+        The evidence must belong to a report of ``projectId`` and that project's client
+        must show results in the dashboard; otherwise 404, so an id from another
+        project or a hidden one reveals nothing.
+        """
+        body = request.get_json(silent=True) or {}
+        project_id = request.args.get("projectId") or body.get("projectId")
+        evidence_id = request.args.get("evidenceId") or body.get("evidenceId")
+        if project_id is None or evidence_id is None:
+            return jsonify({"error": "projectId and evidenceId are required"}), 400
+        project_id, error = parse_int(project_id, "projectId")
+        if error:
+            return jsonify(error), 400
+        evidence_id, error = parse_int(evidence_id, "evidenceId")
+        if error:
+            return jsonify(error), 400
+
+        owner_query = """
+        query EvidenceOwner($evidenceId: bigint!) {
+          evidence_by_pk(id: $evidenceId) {
+            id
+            report {
+              projectId
+              project {
+                client {
+                  extraFields
+                }
+              }
+            }
+          }
+        }
+        """
+        data, error = graphql_request(owner_query, {"evidenceId": evidence_id})
+        if error:
+            return jsonify({"error": error}), 502
+        evidence = (data or {}).get("evidence_by_pk") or {}
+        report = evidence.get("report") or {}
+        if (
+            not evidence
+            or report.get("projectId") != project_id
+            or not shows_results((report.get("project") or {}).get("client"))
+        ):
+            return jsonify({"error": "evidence not found"}), 404
+
+        download_query = """
+        query DownloadOneEvidence($evidenceId: Int!) {
+          downloadEvidence(evidenceId: $evidenceId) {
+            evidenceId
+            filename
+            friendlyName
+            fileBase64
+          }
+        }
+        """
+        data, error = graphql_request(download_query, {"evidenceId": evidence_id})
+        if error:
+            return jsonify({"error": error}), 502
+        return jsonify((data or {}).get("downloadEvidence") or {})
 
     @app.route("/createRetest", methods=["POST"])
     @require_api_key

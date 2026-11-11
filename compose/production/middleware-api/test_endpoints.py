@@ -42,6 +42,8 @@ ROUTES = [
     ("post", "/updateProject", {"projectId": 1, "codename": "x"}),
     ("get", "/getProjects?clientId=1", None),
     ("get", "/getProject?projectId=1", None),
+    ("get", "/getFindingSummaries?projectIds=1", None),
+    ("get", "/getEvidence?projectId=1&evidenceId=1", None),
     ("post", "/createRetest", {"projectId": 1}),
     ("get", "/getStatistics?clientId=1", None),
     ("post", "/generateReport", {"projectId": 1, "templateId": 1}),
@@ -526,6 +528,166 @@ def test_get_project_graphql_error_is_502(client, stub):
     stub.routes = {"GetProject": FakeResponse(status_code=500, text="nope")}
     resp = call(client, "get", "/getProject?projectId=1")
     assert resp.status_code == 502
+
+
+def test_get_project_evidence_none_lists_metadata_without_downloads(client, stub):
+    routes = _get_project_routes({"showResultsInDashboard": True})
+    routes["GetProject"]["project_by_pk"]["reports"][0]["evidence"] = [
+        {"id": 77, "friendlyName": "Shot", "document": "evidence/5/shot.png"},
+    ]
+    stub.routes = routes
+    resp = call(client, "get", "/getProject?projectId=1&evidence=none")
+    assert resp.status_code == 200
+    report = resp.get_json()["project_by_pk"]["reports"][0]
+    assert report["evidence"] == [{"evidenceId": 77, "filename": "shot.png", "friendlyName": "Shot"}]
+    assert [f["title"] for f in report["findings"]] == ["SQLi"]
+    assert stub.queries_matching("downloadEvidence") == []
+
+
+def test_get_project_evidence_none_still_hides_when_flag_not_true(client, stub):
+    stub.routes = _get_project_routes({"showResultsInDashboard": False})
+    report = call(client, "get", "/getProject?projectId=1&evidence=none").get_json()["project_by_pk"]["reports"][0]
+    assert report["findings"] == []
+    assert report["evidence"] == []
+
+
+def test_get_project_rejects_unknown_evidence_mode(client):
+    resp = call(client, "get", "/getProject?projectId=1&evidence=links")
+    assert resp.status_code == 400
+
+
+# --- /getFindingSummaries ---------------------------------------------------
+
+def _summaries_payload(extra_fields=None):
+    return {"project": [{
+        "id": 1,
+        "codename": "BLUE",
+        "complete": False,
+        "client": {"id": 9, "extraFields": extra_fields},
+        "reports": [{
+            "id": 5,
+            "findings": [
+                {
+                    "id": 31, "title": "SQLi", "position": 1, "complete": True, "cvssScore": 9.1,
+                    "description": "<p>The search   endpoint</p><div class=\"richtext-evidence\" data-evidence-id=\"77\"></div><p>concatenates input.</p>",
+                    "severity": {"severity": "Critical", "weight": 1},
+                },
+                {
+                    "id": 32, "title": "Banner", "position": 2, "complete": False, "cvssScore": None,
+                    "description": None, "severity": None,
+                },
+            ],
+        }],
+    }]}
+
+
+def test_get_finding_summaries_requires_project_ids(client):
+    assert call(client, "get", "/getFindingSummaries").status_code == 400
+    assert call(client, "get", "/getFindingSummaries?projectIds=").status_code == 400
+
+
+def test_get_finding_summaries_rejects_non_integer_ids(client):
+    assert call(client, "get", "/getFindingSummaries?projectIds=1,abc").status_code == 400
+
+
+def test_get_finding_summaries_caps_the_number_of_projects(client):
+    ids = ",".join(str(i) for i in range(1, 202))
+    assert call(client, "get", f"/getFindingSummaries?projectIds={ids}").status_code == 400
+
+
+def test_get_finding_summaries_returns_lean_findings(client, stub):
+    stub.routes = {"FindingSummaries": _summaries_payload({"showResultsInDashboard": True})}
+    resp = call(client, "get", "/getFindingSummaries?projectIds=1,1,2")
+    assert resp.status_code == 200
+    assert stub.variables_for("FindingSummaries") == {"projectIds": [1, 2]}
+    project = resp.get_json()["projects"][0]
+    assert project["id"] == 1 and project["codename"] == "BLUE" and project["showResults"] is True
+    first, second = project["findings"]
+    assert first == {
+        "id": 31, "reportId": 5, "title": "SQLi", "summary": "The search endpoint concatenates input.",
+        "position": 1, "complete": True, "cvssScore": 9.1, "severity": "Critical", "severityWeight": 1,
+    }
+    assert second["summary"] == "" and second["severity"] is None and second["complete"] is False
+
+
+def test_get_finding_summaries_selects_no_heavy_fields(client, stub):
+    stub.routes = {"FindingSummaries": _summaries_payload({"showResultsInDashboard": True})}
+    call(client, "get", "/getFindingSummaries?projectIds=1")
+    query = stub.queries_matching("FindingSummaries")[0]["query"]
+    for field in ("evidence", "mitigation", "replication_steps", "guidance", "impact", "affectedEntities"):
+        assert field not in query
+    assert stub.queries_matching("downloadEvidence") == []
+
+
+def test_get_finding_summaries_cuts_long_descriptions(client, stub):
+    payload = _summaries_payload({"showResultsInDashboard": True})
+    payload["project"][0]["reports"][0]["findings"][0]["description"] = "<p>" + "word " * 200 + "</p>"
+    stub.routes = {"FindingSummaries": payload}
+    summary = call(client, "get", "/getFindingSummaries?projectIds=1").get_json()["projects"][0]["findings"][0]["summary"]
+    assert len(summary) == app_module.FINDING_SUMMARY_CHARS
+    assert summary.endswith("…")
+
+
+@pytest.mark.parametrize("extra_fields", [{"showResultsInDashboard": False}, {}, None, {"showResultsInDashboard": "true"}])
+def test_get_finding_summaries_hides_findings_when_flag_not_true(client, stub, extra_fields):
+    stub.routes = {"FindingSummaries": _summaries_payload(extra_fields)}
+    project = call(client, "get", "/getFindingSummaries?projectIds=1").get_json()["projects"][0]
+    assert project["showResults"] is False
+    assert project["findings"] == []
+    assert project["codename"] == "BLUE"
+
+
+def test_get_finding_summaries_graphql_error_is_502(client, stub):
+    stub.routes = {"FindingSummaries": FakeResponse(status_code=500, text="nope")}
+    assert call(client, "get", "/getFindingSummaries?projectIds=1").status_code == 502
+
+
+# --- /getEvidence -----------------------------------------------------------
+
+def _evidence_routes(project_id=1, extra_fields=None, exists=True):
+    owner = {"evidence_by_pk": {
+        "id": 77,
+        "report": {"projectId": project_id, "project": {"client": {"extraFields": extra_fields}}},
+    } if exists else None}
+    return {
+        "EvidenceOwner": owner,
+        "downloadEvidence": {"downloadEvidence": {
+            "evidenceId": 77, "filename": "shot.png", "friendlyName": "Shot", "fileBase64": "eA==",
+        }},
+    }
+
+
+def test_get_evidence_requires_both_ids(client):
+    assert call(client, "get", "/getEvidence?projectId=1").status_code == 400
+    assert call(client, "get", "/getEvidence?evidenceId=77").status_code == 400
+    assert call(client, "get", "/getEvidence?projectId=1&evidenceId=x").status_code == 400
+
+
+def test_get_evidence_downloads_one_file(client, stub):
+    stub.routes = _evidence_routes(extra_fields={"showResultsInDashboard": True})
+    resp = call(client, "get", "/getEvidence?projectId=1&evidenceId=77")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"evidenceId": 77, "filename": "shot.png", "friendlyName": "Shot", "fileBase64": "eA=="}
+    assert stub.variables_for("EvidenceOwner") == {"evidenceId": 77}
+    assert len(stub.queries_matching("downloadEvidence")) == 1
+
+
+@pytest.mark.parametrize("routes", [
+    _evidence_routes(project_id=2, extra_fields={"showResultsInDashboard": True}),
+    _evidence_routes(extra_fields={"showResultsInDashboard": False}),
+    _evidence_routes(extra_fields=None),
+    _evidence_routes(exists=False),
+], ids=["other-project", "results-hidden", "flag-absent", "missing"])
+def test_get_evidence_is_404_without_downloading(client, stub, routes):
+    stub.routes = routes
+    resp = call(client, "get", "/getEvidence?projectId=1&evidenceId=77")
+    assert resp.status_code == 404
+    assert stub.queries_matching("downloadEvidence") == []
+
+
+def test_get_evidence_graphql_error_is_502(client, stub):
+    stub.routes = {"EvidenceOwner": FakeResponse(status_code=500, text="nope")}
+    assert call(client, "get", "/getEvidence?projectId=1&evidenceId=77").status_code == 502
 
 
 # --- /createRetest ----------------------------------------------------------
