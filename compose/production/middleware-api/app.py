@@ -137,14 +137,18 @@ def text_or_blank(value):
     return value if isinstance(value, str) else ""
 
 
-def retest_from(extra_fields):
+def retest_from(extra_fields, in_retest_report=False):
     """
     The retest block of a finding copied by /createRetest, read from its extra fields:
-    ``None`` when the finding has no ``source_finding_id`` (it is not a retest copy).
+    ``None`` when the finding has no ``source_finding_id`` (it is not a retest copy), unless
+    it sits in a "Retest" report. Ghostwriter's finding editor saves only the extra fields
+    that have a spec, so editing a copy drops an unspecified ``source_finding_id``; the
+    block then still carries the verdict, with ``sourceFindingId`` null (the caller matches
+    the copy by its own id).
     """
     extra_fields = extra_fields or {}
     source_finding_id = optional_int(extra_fields.get(FINDING_SOURCE_FINDING_ID_FIELD))
-    if source_finding_id is None:
+    if source_finding_id is None and not in_retest_report:
         return None
     return {
         "sourceFindingId": source_finding_id,
@@ -802,7 +806,10 @@ def create_app():
                     )
                     # A finding copied by /createRetest: where it came from and the verdict.
                     lift_extra_field(
-                        finding, "retest", FINDING_RETEST_FIELDS, retest_from(finding.get("extraFields"))
+                        finding,
+                        "retest",
+                        FINDING_RETEST_FIELDS,
+                        retest_from(finding.get("extraFields"), report.get("title") == RETEST_REPORT_TITLE),
                     )
 
                 evidence_list = report.get("evidence", [])
