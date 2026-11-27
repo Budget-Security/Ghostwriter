@@ -105,6 +105,7 @@
             "position": 1,
             "references": "<p>OWASP SQL Injection</p>",
             "replication_steps": "<p>GET /search?q=' OR '1'='1</p>",
+            "retest": null,
             "severity": {
               "id": 1,
               "severity": "Critical",
@@ -132,6 +133,14 @@
             "position": 2,
             "references": "",
             "replication_steps": "",
+            "retest": {
+              "clientNote": "<p>Header added in the load balancer.</p>",
+              "clientStatus": "Fixed",
+              "positiveControl": "<p>The response still lacks a Content-Security-Policy header.</p>",
+              "sourceFindingId": 22,
+              "sourceProjectId": 19,
+              "verdict": "still_present"
+            },
             "severity": {
               "id": 4,
               "severity": "Low",
