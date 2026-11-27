@@ -6,8 +6,11 @@ Budget-Security/dashboard repo keeps a byte-identical copy in
 ``dashboard/tests/fixtures/ghostwriter_get_project.json`` and tests its parsing against it.
 
 The GraphQL stub is derived from the golden file by undoing what the handler does (raw
-extra fields instead of ``c4Model`` / ``mitigationPrompt`` / ``retest``, evidence ids instead of the
-downloaded blobs), the handler runs on it, and its output must equal the golden file.
+extra fields instead of ``c4Model`` / ``mitigationPrompt`` / ``retest`` / ``details`` / ``facts``,
+evidence ids instead of the downloaded blobs), the handler runs on it, and its output must
+equal the golden file. The stub also carries the internal extra fields the instance holds
+(``INTERNAL_*`` below): the golden file has none of them, so the comparison proves they are
+dropped.
 
 When this fails because the response changed on purpose: regenerate with
 ``UPDATE_GOLDEN=1 pytest test_contract.py``, copy the file to the dashboard fixture, and
@@ -29,12 +32,60 @@ from test_endpoints import HEADERS, GraphQLStub  # noqa: E402
 
 GOLDEN = Path(__file__).parent / "contract" / "get_project.json"
 
+# Internal extra fields as the instance holds them. None may reach the response.
+INTERNAL_FINDING = {
+    "oracle_result": "pass", "client_visible": True, "root_cause_id": "search-binding",
+    "merged_from": [{"title": "Export reads other statements", "suggested_by": "reviewer"}],
+    "prior_rating": {"severity": "High", "score": 7.1}, "quantity_provenance": "<p>wc -l raw/x.txt</p>",
+    "cwe_status": "Allowed / Allowed", "figures": [{"name": "fig1.png", "sha256": "ab12"}],
+    "feedback_refs": ["FB-1"], "penny_finding_id": "F-1001", "poc": "internal",
+}
+INTERNAL_REPORT = {"qa_signoff": "A. Reviewer 2026-11-20", "client_feedback": [{"item": "FB-1"}],
+                   "counts": {"severity": {"Critical": 1}}}
+INTERNAL_PROJECT = {"roe_brute_force": False, "contracted_method": "tool-assisted",
+                    "test_accounts": [{"account": "participant-a", "password": "s3cret"}]}
+
+FINDING_DETAIL_FIELDS = {  # details key -> raw extra field
+    "confidence": "confidence", "oracleDescription": "oracle_description", "rootCause": "root_cause",
+    "remediationDifficulty": "remediation_difficulty", "affectedComponent": "affected_component",
+    "occurrences": "occurrences", "attackChain": "attack_chain", "claimBasis": "claim_basis",
+    "ratingRationale": "rating_rationale", "principalsTested": "principals_tested",
+    "measurementWindow": "measurement_window", "priorIdentifiers": "prior_identifiers",
+    "relatedFindings": "related_findings", "evidenceContainsLiveSecrets": "evidence_contains_live_secrets",
+}
+CLASSIFICATION_FIELDS = {"cweId": "cwe_id", "owaspCategory": "owasp_category", "apiTop10": "api_top10",
+                         "wstg": "wstg", "asvs": "asvs", "ncscId": "ncsc_id"}
+REPORT_FACT_FIELDS = {
+    "version": "version", "previousVersionDelivered": "previous_version_delivered",
+    "executiveSummary": "ExecutiveSummary", "engagementCleanup": "EngagementCleanup",
+    "coverageNotAssessed": "CoverageNotAssessed", "identifierMapping": "identifier_mapping",
+    "testingWindow": "testing_window", "captureSessions": "capture_sessions", "overallRisk": "overall_risk",
+    "limitations": "limitations", "notAssessed": "not_assessed", "toolingDisclosure": "tooling_disclosure",
+    "testDataLog": "test_data_log",
+}
+
+
+def _raw_finding_extra(details):
+    raw = {FINDING_DETAIL_FIELDS[k]: copy.deepcopy(v) for k, v in details.items() if k in FINDING_DETAIL_FIELDS}
+    raw.update({CLASSIFICATION_FIELDS[k]: v for k, v in details["classification"].items()})
+    # Sub-fields that are internal: a link's evidence path, an occurrence's raw request file.
+    for link in raw["attack_chain"]:
+        link["evidence"] = "raw/injection/search-001.txt"
+    for occurrence in raw["occurrences"]:
+        occurrence["request"] = "raw/injection/search-002.txt"
+    return dict(INTERNAL_FINDING, **raw)
+
 
 def _graphql_data_from(golden):
     """The GetProject / downloadEvidence data that produces ``golden`` through the handler."""
     raw = copy.deepcopy(golden)
     downloads = {}
+    raw["project_by_pk"]["extraFields"] = dict(INTERNAL_PROJECT)
+    raw["project_by_pk"]["client"]["extraFields"] = {"showResultsInDashboard": True}
     for report in raw["project_by_pk"]["reports"]:
+        facts = report.pop("facts")
+        report["extraFields"] = dict(INTERNAL_REPORT, **{REPORT_FACT_FIELDS[k]: copy.deepcopy(v)
+                                                          for k, v in facts.items()})
         model = report.pop("c4Model", None)
         if model is not None:
             report["extraFields"][app_module.REPORT_C4_MODEL_FIELD] = model
@@ -42,6 +93,7 @@ def _graphql_data_from(golden):
             downloads[ev["evidenceId"]] = ev
         report["evidence"] = [{"id": ev["evidenceId"]} for ev in report["evidence"]]
         for finding in report["findings"]:
+            finding["extraFields"] = _raw_finding_extra(finding.pop("details"))
             prompt = finding.pop("mitigationPrompt", None)
             if prompt is not None:
                 finding["extraFields"][app_module.FINDING_MITIGATION_PROMPT_FIELD] = prompt
@@ -97,3 +149,9 @@ def test_golden_covers_the_fields_the_backend_reads():
     assert all("findingGuidance" not in f for f in report["findings"])
     assert any(f["retest"] is None for f in report["findings"])
     assert any(f["retest"] and f["retest"]["verdict"] for f in report["findings"])
+    assert any(f["details"]["occurrences"] and f["details"]["attackChain"] for f in report["findings"])
+    assert any(not f["details"]["occurrences"] for f in report["findings"])
+    assert report["facts"]["testDataLog"] and report["facts"]["executiveSummary"]
+    # Nothing raw: every extra field the backend may read is lifted, the rest is gone.
+    text = GOLDEN.read_text(encoding="utf-8")
+    assert '"extraFields"' not in text and "penny" not in text.lower()

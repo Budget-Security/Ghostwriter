@@ -1,9 +1,6 @@
 {
   "project_by_pk": {
     "client": {
-      "extraFields": {
-        "showResultsInDashboard": true
-      },
       "id": 9,
       "name": "World Co",
       "shortName": "WORLD"
@@ -15,7 +12,6 @@
     "description": "Web application test",
     "endDate": "2026-10-10",
     "endTime": "17:00:00",
-    "extraFields": {},
     "id": 55555,
     "operatorId": null,
     "projectType": {
@@ -84,7 +80,50 @@
             "friendlyName": "Search request"
           }
         ],
-        "extraFields": {},
+        "facts": {
+          "captureSessions": [
+            {
+              "authorisation": "PTREQ-1",
+              "date": "2026-11-19",
+              "purpose": "Re-capture of the search figures",
+              "read_only": true
+            }
+          ],
+          "coverageNotAssessed": "",
+          "engagementCleanup": "<p>Every document created during the test was removed on 2026-11-15.</p>",
+          "executiveSummary": "<p>One finding carries the risk: the search query reads other accounts' data.</p>",
+          "identifierMapping": [
+            {
+              "how": "renumbered",
+              "now": "SQL injection in search",
+              "prior": "NN-003"
+            }
+          ],
+          "limitations": [
+            "brute force",
+            "denial of service"
+          ],
+          "notAssessed": [
+            {
+              "class": "denial-of-service",
+              "reason": "Excluded by the rules of engagement."
+            }
+          ],
+          "overallRisk": "High",
+          "previousVersionDelivered": "1.0",
+          "testDataLog": [
+            {
+              "account": "participant-a",
+              "created_at": "2026-11-05T10:00:00Z",
+              "kind": "document",
+              "object": "doc-1",
+              "state": "removed"
+            }
+          ],
+          "testingWindow": "2026-11-04 to 2026-11-15",
+          "toolingDisclosure": "<p>Manual testing, assisted by tools.</p>",
+          "version": "1.1"
+        },
         "findings": [
           {
             "affectedEntities": "<p>GET /search</p>",
@@ -92,7 +131,79 @@
             "cvssScore": 9.8,
             "cvssVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
             "description": "<p>The search endpoint concatenates input into SQL.</p><div class=\"richtext-evidence\" data-evidence-id=\"77\"></div>",
-            "extraFields": {},
+            "details": {
+              "affectedComponent": "Search API",
+              "attackChain": [
+                {
+                  "basis": "measured",
+                  "claim": "The search parameter reaches the SQL query unbound.",
+                  "rating_depends": true,
+                  "step": 1
+                },
+                {
+                  "basis": "inferred",
+                  "claim": "The database account can read every tenant's tables.",
+                  "rating_depends": false,
+                  "step": 2
+                }
+              ],
+              "claimBasis": "mixed",
+              "classification": {
+                "apiTop10": [],
+                "asvs": [
+                  "V1.2.4"
+                ],
+                "cweId": "CWE-89",
+                "ncscId": [],
+                "owaspCategory": "A03:2021 Injection",
+                "wstg": [
+                  "WSTG-INPV-05"
+                ]
+              },
+              "confidence": "Confirmed",
+              "evidenceContainsLiveSecrets": false,
+              "measurementWindow": "2026-11-04 to 2026-11-05",
+              "occurrences": [
+                {
+                  "component": "Search API",
+                  "measured": true,
+                  "observed": "Rows of every account returned.",
+                  "operation": "GET /search",
+                  "response_size": 48211
+                },
+                {
+                  "component": "Search API",
+                  "measured": false,
+                  "observed": "Same query builder; not requested.",
+                  "operation": "GET /search/export",
+                  "prior_identifier": "NN-004",
+                  "prior_severity": "High"
+                }
+              ],
+              "oracleDescription": "<p>The search returned rows of a statement that belongs to another account.</p>",
+              "principalsTested": [
+                {
+                  "account": "participant-a",
+                  "office": "Utrecht",
+                  "owns_object": false,
+                  "role": "user"
+                }
+              ],
+              "priorIdentifiers": [
+                "NN-003",
+                "NN-004"
+              ],
+              "ratingRationale": "<p>Attack Complexity: Low. One request, no preconditions.</p>",
+              "relatedFindings": [
+                {
+                  "note": "",
+                  "relation": "related",
+                  "title": "Missing security headers"
+                }
+              ],
+              "remediationDifficulty": "Low",
+              "rootCause": "<p>The search query concatenates the input instead of binding it as a parameter.</p>"
+            },
             "findingType": {
               "findingType": "Web",
               "id": 1
@@ -120,7 +231,30 @@
             "cvssScore": 3.1,
             "cvssVector": "",
             "description": "<p>No Content-Security-Policy header.</p>",
-            "extraFields": {},
+            "details": {
+              "affectedComponent": "",
+              "attackChain": [],
+              "claimBasis": "",
+              "classification": {
+                "apiTop10": [],
+                "asvs": [],
+                "cweId": "",
+                "ncscId": [],
+                "owaspCategory": "",
+                "wstg": []
+              },
+              "confidence": "Firm",
+              "evidenceContainsLiveSecrets": true,
+              "measurementWindow": "",
+              "occurrences": [],
+              "oracleDescription": "",
+              "principalsTested": [],
+              "priorIdentifiers": [],
+              "ratingRationale": "",
+              "relatedFindings": [],
+              "remediationDifficulty": "",
+              "rootCause": ""
+            },
             "findingType": {
               "findingType": "Web",
               "id": 1

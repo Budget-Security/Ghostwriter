@@ -173,6 +173,120 @@ def lift_extra_field(item, key, field_name, value):
             extra_fields.pop(name, None)
 
 
+# ---- Client-facing extra fields ---------------------------------------------------------
+# /getProject returns these as a `details` block per finding and a `facts` block per report,
+# and drops the raw `extraFields` everywhere, so an internal field (oracle result, merge
+# history, quantity provenance, figure hashes, QA sign-off, rules of engagement, test
+# accounts, ...) never leaves Ghostwriter. An allow-list, not a deny-list: a field added on
+# the instance stays internal until it is named here. List items keep only the named keys
+# with scalar values, because some sub-fields are internal (an attack-chain link's
+# `evidence` is a raw file path or an internal id; an occurrence's `request` can be one).
+OCCURRENCE_KEYS = ("component", "operation", "observed", "measured", "response_size",
+                   "prior_identifier", "prior_severity", "prior_cvss", "prior_cvss_vector")
+ATTACK_CHAIN_KEYS = ("step", "claim", "basis", "rating_depends")
+PRINCIPAL_KEYS = ("account", "role", "office", "owns_object")
+RELATED_FINDING_KEYS = ("title", "relation", "note")
+IDENTIFIER_MAPPING_KEYS = ("prior", "now", "how")
+CAPTURE_SESSION_KEYS = ("date", "purpose", "authorisation", "read_only")
+NOT_ASSESSED_KEYS = ("class", "reason")
+TEST_DATA_LOG_KEYS = ("object", "kind", "created_at", "account", "state")
+
+
+def _json_value(value):
+    """A JSON extra field's value: parsed when stored as a JSON string."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
+def _text(value):
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _text_list(value):
+    """A list of non-empty strings (numbers are written as text); anything else is []."""
+    value = _json_value(value)
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, bool) or item is None:
+            continue
+        if isinstance(item, (int, float)):
+            item = str(item)
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
+
+
+def _items(value, keys):
+    """A list of objects, each cut to `keys` with scalar values only."""
+    value = _json_value(value)
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        kept = {k: item[k] for k in keys
+                if k in item and (item[k] is None or isinstance(item[k], (str, int, float, bool)))}
+        if any(v not in (None, "") for v in kept.values()):
+            out.append(kept)
+    return out
+
+
+def finding_details_from(extra_fields):
+    """The client-facing structured fields of a finding (Penny's pipeline writes them)."""
+    e = extra_fields or {}
+    return {
+        "confidence": _text(e.get("confidence")),
+        "oracleDescription": _text(e.get("oracle_description")),
+        "rootCause": _text(e.get("root_cause")),
+        "remediationDifficulty": _text(e.get("remediation_difficulty")),
+        "affectedComponent": _text(e.get("affected_component")),
+        "occurrences": _items(e.get("occurrences"), OCCURRENCE_KEYS),
+        "attackChain": _items(e.get("attack_chain"), ATTACK_CHAIN_KEYS),
+        "claimBasis": _text(e.get("claim_basis")),
+        "ratingRationale": _text(e.get("rating_rationale")),
+        "principalsTested": _items(e.get("principals_tested"), PRINCIPAL_KEYS),
+        "measurementWindow": _text(e.get("measurement_window")),
+        "priorIdentifiers": _text_list(e.get("prior_identifiers")),
+        "classification": {
+            "cweId": _text(e.get("cwe_id")),
+            "owaspCategory": _text(e.get("owasp_category")),
+            "apiTop10": _text_list(e.get("api_top10")),
+            "wstg": _text_list(e.get("wstg")),
+            "asvs": _text_list(e.get("asvs")),
+            "ncscId": _text_list(e.get("ncsc_id")),
+        },
+        "relatedFindings": _items(e.get("related_findings"), RELATED_FINDING_KEYS),
+        "evidenceContainsLiveSecrets": e.get("evidence_contains_live_secrets") is True,
+    }
+
+
+def report_facts_from(extra_fields):
+    """The client-facing fields of a report: the engagement as the report states it."""
+    e = extra_fields or {}
+    return {
+        "version": _text(e.get("version")),
+        "previousVersionDelivered": _text(e.get("previous_version_delivered")),
+        "executiveSummary": _text(e.get("ExecutiveSummary")),
+        "engagementCleanup": _text(e.get("EngagementCleanup")),
+        "coverageNotAssessed": _text(e.get("CoverageNotAssessed")),
+        "identifierMapping": _items(e.get("identifier_mapping"), IDENTIFIER_MAPPING_KEYS),
+        "testingWindow": _text(e.get("testing_window")),
+        "captureSessions": _items(e.get("capture_sessions"), CAPTURE_SESSION_KEYS),
+        "overallRisk": _text(e.get("overall_risk")),
+        "limitations": _text_list(e.get("limitations")),
+        "notAssessed": _items(e.get("not_assessed"), NOT_ASSESSED_KEYS),
+        "toolingDisclosure": _text(e.get("tooling_disclosure")),
+        "testDataLog": _items(e.get("test_data_log"), TEST_DATA_LOG_KEYS),
+    }
+
+
 def retest_client_note_html(descriptions):
     """The customer's retest comments as rich text: each one HTML-escaped in a ``<p>``."""
     paragraphs = []
@@ -783,6 +897,11 @@ def create_app():
             # and the `_contains` filters used by /getStatistics.
             client_extra_fields = (project_data.get("client") or {}).get("extraFields") or {}
             show_results = client_extra_fields.get("showResultsInDashboard") is True
+            # The project's and client's own extra fields are internal (rules of engagement,
+            # test accounts, the results flag): read above, never returned.
+            project_data.pop("extraFields", None)
+            if isinstance(project_data.get("client"), dict):
+                project_data["client"].pop("extraFields", None)
 
             for report in project_data.get("reports", []):
                 if not show_results:
@@ -792,6 +911,8 @@ def create_app():
                     report["findings"] = []
                     report["evidence"] = []
                     lift_extra_field(report, "c4Model", REPORT_C4_MODEL_FIELD, None)
+                    report["facts"] = None
+                    report.pop("extraFields", None)
                     continue
 
                 lift_extra_field(
@@ -811,6 +932,11 @@ def create_app():
                         FINDING_RETEST_FIELDS,
                         retest_from(finding.get("extraFields"), report.get("title") == RETEST_REPORT_TITLE),
                     )
+                    finding["details"] = finding_details_from(finding.get("extraFields"))
+                    # Only the allow-listed fields leave Ghostwriter (see finding_details_from).
+                    finding.pop("extraFields", None)
+                report["facts"] = report_facts_from(report.get("extraFields"))
+                report.pop("extraFields", None)
 
                 evidence_list = report.get("evidence", [])
                 if evidence_mode == "none":
@@ -879,6 +1005,7 @@ def create_app():
                 cvssScore
                 sourceFindingId: extraFields(path: "source_finding_id")
                 retestVerdict: extraFields(path: "retest_verdict")
+                confidence: extraFields(path: "confidence")
                 severity {
                   severity
                   weight
@@ -919,6 +1046,8 @@ def create_app():
                             # Set on findings /createRetest copied; null / "" otherwise.
                             "sourceFindingId": optional_int(finding.get("sourceFindingId")),
                             "retestVerdict": text_or_blank(finding.get("retestVerdict")),
+                            # Confirmed / Firm / Tentative; "" where the pipeline set none.
+                            "confidence": _text(finding.get("confidence")),
                         })
             projects.append({
                 "id": project.get("id"),
