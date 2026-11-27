@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 import os
 import re
@@ -29,6 +30,27 @@ POC_DEFAULT_CPU = 0.5
 # customer portal's VMS view. Internal names as configured in Ghostwriter's admin panel.
 FINDING_MITIGATION_PROMPT_FIELD = "mitigation_prompt"  # Finding, text: a fix prompt for an AI coding tool
 REPORT_C4_MODEL_FIELD = "c4_model"  # Report, JSON: the client-facing projection of the C4 model
+
+# Retest traceability: extra fields on a finding copied by /createRetest. The copy points
+# back at the finding it was copied from; the verdict is written by the tester (or Penny).
+FINDING_SOURCE_FINDING_ID_FIELD = "source_finding_id"  # integer, set by /createRetest
+FINDING_SOURCE_PROJECT_ID_FIELD = "source_project_id"  # integer, set by /createRetest
+FINDING_RETEST_CLIENT_STATUS_FIELD = "retest_client_status"  # text: the customer's status display
+FINDING_RETEST_CLIENT_NOTE_FIELD = "retest_client_note"  # rich text: the customer's note
+FINDING_RETEST_VERDICT_FIELD = "retest_verdict"  # text: fixed / still_present / ..., by the tester
+FINDING_POSITIVE_CONTROL_FIELD = "positive_control"  # rich text: how the retest showed the fix works
+FINDING_RETEST_FIELDS = (
+    FINDING_SOURCE_FINDING_ID_FIELD,
+    FINDING_SOURCE_PROJECT_ID_FIELD,
+    FINDING_RETEST_VERDICT_FIELD,
+    FINDING_POSITIVE_CONTROL_FIELD,
+    FINDING_RETEST_CLIENT_STATUS_FIELD,
+    FINDING_RETEST_CLIENT_NOTE_FIELD,
+)
+# The report /createRetest puts the copied findings in. Retests made before retest
+# traceability used "Original Findings", which /getProject and /generateReport hide.
+RETEST_REPORT_TITLE = "Retest"
+LEGACY_RETEST_REPORT_TITLE = "Original Findings"
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -98,15 +120,64 @@ def c4_model_from(extra_fields):
     return value
 
 
+def optional_int(value):
+    """An integer extra field as an int: ``None`` when unset, blank or not a whole number."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
+def text_or_blank(value):
+    """A text extra field as a string, ``""`` when unset or not text."""
+    return value if isinstance(value, str) else ""
+
+
+def retest_from(extra_fields):
+    """
+    The retest block of a finding copied by /createRetest, read from its extra fields:
+    ``None`` when the finding has no ``source_finding_id`` (it is not a retest copy).
+    """
+    extra_fields = extra_fields or {}
+    source_finding_id = optional_int(extra_fields.get(FINDING_SOURCE_FINDING_ID_FIELD))
+    if source_finding_id is None:
+        return None
+    return {
+        "sourceFindingId": source_finding_id,
+        "sourceProjectId": optional_int(extra_fields.get(FINDING_SOURCE_PROJECT_ID_FIELD)),
+        "verdict": text_or_blank(extra_fields.get(FINDING_RETEST_VERDICT_FIELD)),
+        "positiveControl": text_or_blank(extra_fields.get(FINDING_POSITIVE_CONTROL_FIELD)),
+        "clientStatus": text_or_blank(extra_fields.get(FINDING_RETEST_CLIENT_STATUS_FIELD)),
+        "clientNote": text_or_blank(extra_fields.get(FINDING_RETEST_CLIENT_NOTE_FIELD)),
+    }
+
+
 def lift_extra_field(item, key, field_name, value):
     """
-    Set ``item[key]`` to ``value`` and drop the raw ``field_name`` from the item's
-    ``extraFields``, so the response carries it once (a C4 model is ~170 kB).
+    Set ``item[key]`` to ``value`` and drop the raw ``field_name`` (one name or a tuple
+    of names) from the item's ``extraFields``, so the response carries it once (a C4
+    model is ~170 kB).
     """
     item[key] = value
     extra_fields = item.get("extraFields")
     if isinstance(extra_fields, dict):
-        extra_fields.pop(field_name, None)
+        for name in (field_name,) if isinstance(field_name, str) else field_name:
+            extra_fields.pop(name, None)
+
+
+def retest_client_note_html(descriptions):
+    """The customer's retest comments as rich text: each one HTML-escaped in a ``<p>``."""
+    paragraphs = []
+    for description in descriptions:
+        if not isinstance(description, str) or not description.strip():
+            continue
+        escaped = html.escape(description.strip()).replace("\r\n", "\n").replace("\n", "<br>")
+        paragraphs.append(f"<p>{escaped}</p>")
+    return "".join(paragraphs)
 
 
 def evidence_metadata(evidence):
@@ -729,6 +800,10 @@ def create_app():
                         FINDING_MITIGATION_PROMPT_FIELD,
                         mitigation_prompt_from(finding.get("extraFields")),
                     )
+                    # A finding copied by /createRetest: where it came from and the verdict.
+                    lift_extra_field(
+                        finding, "retest", FINDING_RETEST_FIELDS, retest_from(finding.get("extraFields"))
+                    )
 
                 evidence_list = report.get("evidence", [])
                 if evidence_mode == "none":
@@ -755,6 +830,8 @@ def create_app():
         The findings of several projects in one call, without the text fields, evidence
         or C4 model /getProject carries: what a findings list or a severity count needs.
         ``hasC4Model`` says whether a report holds a C4 model (false while results are hidden).
+        A finding /createRetest copied carries ``sourceFindingId`` and ``retestVerdict``
+        (null and "" on any other finding).
         Same gating as /getProject: a client without showResultsInDashboard gets no
         findings. Projects that do not exist are left out of the response.
         """
@@ -793,6 +870,8 @@ def create_app():
                 position
                 complete
                 cvssScore
+                sourceFindingId: extraFields(path: "source_finding_id")
+                retestVerdict: extraFields(path: "retest_verdict")
                 severity {
                   severity
                   weight
@@ -830,6 +909,9 @@ def create_app():
                             "cvssScore": finding.get("cvssScore"),
                             "severity": severity.get("severity"),
                             "severityWeight": severity.get("weight"),
+                            # Set on findings /createRetest copied; null / "" otherwise.
+                            "sourceFindingId": optional_int(finding.get("sourceFindingId")),
+                            "retestVerdict": text_or_blank(finding.get("retestVerdict")),
                         })
             projects.append({
                 "id": project.get("id"),
@@ -907,10 +989,45 @@ def create_app():
     @app.route("/createRetest", methods=["POST"])
     @require_api_key
     def create_retest():
+        """
+        Copy findings of a project into a new retest project, in a report titled
+        RETEST_REPORT_TITLE. Each copy carries ``source_finding_id`` / ``source_project_id``
+        and the customer's comment (``retest_client_status`` / ``retest_client_note``);
+        its ``retest_verdict`` and ``positive_control`` start blank.
+
+        Optional: ``findingIds`` (copy only those; an id the project does not have is a
+        400 and nothing is created; absent copies every finding), ``codename``,
+        ``startDate`` and ``endDate`` (overrides for the new project).
+        """
         body = request.get_json(silent=True) or {}
         project_id = body.get("projectId")
         if project_id is None:
             return jsonify({"error": "projectId is required"}), 400
+        project_id, err = parse_int(project_id, "projectId")
+        if err:
+            return jsonify(err), 400
+
+        finding_ids = None
+        if body.get("findingIds") is not None:
+            raw_ids = body["findingIds"]
+            if not isinstance(raw_ids, list) or not raw_ids:
+                return jsonify({"error": "findingIds must be a non-empty list of integers"}), 400
+            finding_ids = []
+            for raw_id in raw_ids:
+                value = None if isinstance(raw_id, bool) else optional_int(raw_id)
+                if value is None:
+                    return jsonify({"error": "findingIds must be a non-empty list of integers"}), 400
+                if value not in finding_ids:
+                    finding_ids.append(value)
+
+        overrides = {}
+        for key in ("codename", "startDate", "endDate"):
+            value = body.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                return jsonify({"error": f"{key} must be a non-empty string"}), 400
+            overrides[key] = value.strip()
 
         comments = body.get("comments") or []
         comments_by_finding = {}
@@ -936,6 +1053,8 @@ def create_app():
             slackChannel
             collab_note
             reports {
+              id
+              title
               findings {
                 id
                 title
@@ -968,15 +1087,43 @@ def create_app():
         if not project:
             return jsonify({"error": f"project {project_id} not found"}), 404
 
-        # 2. Create new project with "Retest - [Original Name]"
+        # 2. Pick the findings to copy, before anything is created. By default every
+        #    finding of the project's own reports; a retest report's findings (the
+        #    "Retest" report, or the legacy "Original Findings" one) are copies and are
+        #    left out. Asked for by id, a "Retest" report's copies may be retested again.
+        source_findings = []
+        retest_copies = []
+        for report in project.get("reports") or []:
+            title = report.get("title")
+            if title == LEGACY_RETEST_REPORT_TITLE:
+                continue
+            target = retest_copies if title == RETEST_REPORT_TITLE else source_findings
+            target.extend(report.get("findings") or [])
+
+        if finding_ids is None:
+            selected = source_findings
+        else:
+            by_id = {}
+            for finding in source_findings + retest_copies:
+                fid = optional_int(finding.get("id"))
+                if fid is not None:
+                    by_id.setdefault(fid, finding)
+            unknown = [fid for fid in finding_ids if fid not in by_id]
+            if unknown:
+                return jsonify({"error": "unknown findingIds", "findingIds": unknown}), 400
+            selected = [by_id[fid] for fid in finding_ids]
+
+        # 3. Create the new project, "Retest - [Original Name]" unless a codename is given
         original_name = project.get("codename") or project.get("description") or f"Project {project_id}"
+        start_date = overrides.get("startDate") or project.get("startDate")
+        end_date = overrides.get("endDate") or project.get("endDate")
         new_project_input = {
             "clientId": project["clientId"],
             "projectTypeId": project["projectTypeId"],
-            "codename": f"Retest - {original_name}",
+            "codename": overrides.get("codename") or f"Retest - {original_name}",
             "description": project.get("description") or "",
-            "startDate": project.get("startDate"),
-            "endDate": project.get("endDate"),
+            "startDate": start_date,
+            "endDate": end_date,
             "startTime": project.get("startTime"),
             "endTime": project.get("endTime"),
             "timezone": project.get("timezone"),
@@ -1001,7 +1148,7 @@ def create_app():
 
         new_project_id = proj_data["insert_project_one"]["id"]
 
-        # 3. Create report named "Original Findings" in the new project
+        # 4. Create the report the copies go in
         create_report_query = """
         mutation CreateReport($object: report_insert_input!) {
           insert_report_one(object: $object) {
@@ -1012,9 +1159,9 @@ def create_app():
         report_data, error = graphql_request(create_report_query, {
             "object": {
                 "projectId": new_project_id,
-                "title": "Original Findings",
-                "creation": project.get("endDate"),
-                "last_update": project.get("endDate"),
+                "title": RETEST_REPORT_TITLE,
+                "creation": end_date,
+                "last_update": end_date,
                 "archived": False,
                 "complete": False,
                 "delivered": False,
@@ -1026,8 +1173,9 @@ def create_app():
 
         new_report_id = report_data["insert_report_one"]["id"]
 
-        # 4. Collect all findings from the original project's reports,
-        #    tracking original IDs so we can map comments later
+        # Build the copies, tracking original IDs so the response can map them. The
+        # finding text is copied unchanged; the customer's comment and the link back
+        # to the original go in the copy's extra fields.
         all_findings = []
         original_ids = []
         finding_fields = [
@@ -1037,27 +1185,29 @@ def create_app():
             "findingGuidance", "extraFields", "severityId", "findingTypeId",
             "hostDetectionTechniques", "networkDetectionTechniques",
         ]
-        for report in project.get("reports", []):
-            for finding in report.get("findings", []):
-                original_finding_id = finding.get("id")
-                new_finding = {k: finding[k] for k in finding_fields if k in finding and finding[k] is not None}
+        for finding in selected:
+            original_finding_id = optional_int(finding.get("id"))
+            new_finding = {k: finding[k] for k in finding_fields if k in finding and finding[k] is not None}
 
-                # Apply comment data: prepend status to title, append description
-                if original_finding_id is not None and int(original_finding_id) in comments_by_finding:
-                    extra_text = ""
-                    for comment in comments_by_finding[int(original_finding_id)]:
-                        status = comment.get("status")
-                        if status:
-                            new_finding["title"] = f"{status} - {new_finding.get('title', '')}"
-                        desc = comment.get("description", "")
-                        if desc:
-                            extra_text += f"\n\n<p><strong>Retest Comment:</strong></p>\n{desc}"
-                    if extra_text:
-                        new_finding["description"] = (new_finding.get("description") or "") + extra_text
+            finding_comments = comments_by_finding.get(original_finding_id, [])
+            statuses = [text_or_blank(c.get("status")).strip() for c in finding_comments]
+            statuses = [status for status in statuses if status]
+            extra_fields = dict(new_finding.get("extraFields") or {})
+            extra_fields.update({
+                FINDING_SOURCE_FINDING_ID_FIELD: original_finding_id,
+                FINDING_SOURCE_PROJECT_ID_FIELD: project_id,
+                FINDING_RETEST_CLIENT_STATUS_FIELD: statuses[-1] if statuses else "",
+                FINDING_RETEST_CLIENT_NOTE_FIELD: retest_client_note_html(
+                    c.get("description") for c in finding_comments
+                ),
+                FINDING_RETEST_VERDICT_FIELD: "",
+                FINDING_POSITIVE_CONTROL_FIELD: "",
+            })
+            new_finding["extraFields"] = extra_fields
 
-                new_finding["reportId"] = new_report_id
-                all_findings.append(new_finding)
-                original_ids.append(original_finding_id)
+            new_finding["reportId"] = new_report_id
+            all_findings.append(new_finding)
+            original_ids.append(original_finding_id)
 
         # 5. Insert findings into the new report, returning new IDs
         findings_count = 0
@@ -1135,15 +1285,17 @@ def create_app():
                 })
 
         result = {
-            "originalProjectId": int(project_id),
+            "projectId": new_project_id,
+            "reportId": new_report_id,
+            "findingsCount": findings_count,
+            "findingIdMapping": old_to_new,
+            "evidenceErrors": evidence_errors,
+            # The names this endpoint returned before retest traceability, kept for old callers.
+            "originalProjectId": project_id,
             "newProjectId": new_project_id,
             "newReportId": new_report_id,
             "findingsCopied": findings_count,
-            "findingIdMapping": old_to_new,
         }
-        if evidence_errors:
-            result["evidenceErrors"] = evidence_errors
-
         return jsonify(result)
 
     @app.route("/getStatistics", methods=["GET"])

@@ -6,7 +6,7 @@ Budget-Security/dashboard repo keeps a byte-identical copy in
 ``dashboard/tests/fixtures/ghostwriter_get_project.json`` and tests its parsing against it.
 
 The GraphQL stub is derived from the golden file by undoing what the handler does (raw
-extra fields instead of ``c4Model`` / ``mitigationPrompt``, evidence ids instead of the
+extra fields instead of ``c4Model`` / ``mitigationPrompt`` / ``retest``, evidence ids instead of the
 downloaded blobs), the handler runs on it, and its output must equal the golden file.
 
 When this fails because the response changed on purpose: regenerate with
@@ -45,6 +45,16 @@ def _graphql_data_from(golden):
             prompt = finding.pop("mitigationPrompt", None)
             if prompt is not None:
                 finding["extraFields"][app_module.FINDING_MITIGATION_PROMPT_FIELD] = prompt
+            retest = finding.pop("retest", None)
+            if retest is not None:
+                finding["extraFields"].update({
+                    app_module.FINDING_SOURCE_FINDING_ID_FIELD: retest["sourceFindingId"],
+                    app_module.FINDING_SOURCE_PROJECT_ID_FIELD: retest["sourceProjectId"],
+                    app_module.FINDING_RETEST_VERDICT_FIELD: retest["verdict"],
+                    app_module.FINDING_POSITIVE_CONTROL_FIELD: retest["positiveControl"],
+                    app_module.FINDING_RETEST_CLIENT_STATUS_FIELD: retest["clientStatus"],
+                    app_module.FINDING_RETEST_CLIENT_NOTE_FIELD: retest["clientNote"],
+                })
     return raw, downloads
 
 
@@ -69,7 +79,8 @@ def test_get_project_matches_the_golden_response(client, monkeypatch):
     body = response.get_json()
 
     if os.environ.get("UPDATE_GOLDEN"):
-        GOLDEN.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+        # LF on every platform: the dashboard keeps a byte-identical copy.
+        GOLDEN.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8", newline="\n")
         pytest.skip("golden file rewritten; copy it to the dashboard fixture")
     assert body == golden, (
         "The /getProject response changed. If on purpose: UPDATE_GOLDEN=1 pytest test_contract.py, "
@@ -84,3 +95,5 @@ def test_golden_covers_the_fields_the_backend_reads():
     assert any(f["mitigationPrompt"] for f in report["findings"])
     assert any(f["mitigationPrompt"] is None for f in report["findings"])
     assert all("findingGuidance" not in f for f in report["findings"])
+    assert any(f["retest"] is None for f in report["findings"])
+    assert any(f["retest"] and f["retest"]["verdict"] for f in report["findings"])

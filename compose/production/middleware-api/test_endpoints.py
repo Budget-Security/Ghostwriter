@@ -17,6 +17,7 @@ Run from this directory:
     pytest
 """
 import base64
+import copy
 import os
 
 import pytest
@@ -524,6 +525,75 @@ def test_get_project_hides_c4_model_when_flag_not_true(client, stub):
     assert report["findings"] == []
 
 
+RETEST_EXTRA_FIELDS = {
+    "source_finding_id": 22,
+    "source_project_id": 19,
+    "retest_verdict": "still_present",
+    "positive_control": "<p>The check still rejects the payload.</p>",
+    "retest_client_status": "Fixed",
+    "retest_client_note": "<p>Patched in 2.4</p>",
+}
+
+
+def test_get_project_lifts_the_retest_block(client, stub):
+    stub.routes = _project_with_extra_fields(
+        {"showResultsInDashboard": True}, {}, dict(RETEST_EXTRA_FIELDS, poc="keep"),
+    )
+    finding = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]["findings"][0]
+    assert finding["retest"] == {
+        "sourceFindingId": 22,
+        "sourceProjectId": 19,
+        "verdict": "still_present",
+        "positiveControl": "<p>The check still rejects the payload.</p>",
+        "clientStatus": "Fixed",
+        "clientNote": "<p>Patched in 2.4</p>",
+    }
+    # Carried once: the six raw fields leave extraFields, everything else stays.
+    assert finding["extraFields"] == {"poc": "keep"}
+
+
+def test_get_project_retest_block_defaults_unset_values(client, stub):
+    """A copy whose verdict is not given yet: strings read as "", a missing project id as null."""
+    stub.routes = _project_with_extra_fields(
+        {"showResultsInDashboard": True}, {}, {"source_finding_id": "22", "retest_verdict": None},
+    )
+    finding = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]["findings"][0]
+    assert finding["retest"] == {
+        "sourceFindingId": 22, "sourceProjectId": None, "verdict": "", "positiveControl": "",
+        "clientStatus": "", "clientNote": "",
+    }
+    assert finding["extraFields"] == {}
+
+
+@pytest.mark.parametrize("finding_extra", [
+    None,
+    {},
+    {"source_finding_id": None, "retest_verdict": "fixed"},
+    {"source_finding_id": ""},
+    {"source_finding_id": "abc"},
+], ids=["null-extrafields", "keys-absent", "null-id", "blank-id", "garbage-id"])
+def test_get_project_retest_is_null_without_a_source_finding(client, stub, finding_extra):
+    stub.routes = _project_with_extra_fields({"showResultsInDashboard": True}, {}, finding_extra)
+    finding = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]["findings"][0]
+    assert finding["retest"] is None
+    assert "retest_verdict" not in (finding["extraFields"] or {})
+
+
+def test_get_project_returns_the_retest_report(client, stub):
+    """The query hides only the legacy "Original Findings" report, so "Retest" comes back."""
+    stub.routes = _get_project_routes({"showResultsInDashboard": True})
+    call(client, "get", "/getProject?projectId=1")
+    query = stub.queries_matching("GetProject")[0]["query"]
+    assert 'reports(where: {title: {_neq: "Original Findings"}})' in query
+    assert '"Retest"' not in query
+
+
+def test_get_project_hides_the_retest_block_when_flag_not_true(client, stub):
+    stub.routes = _project_with_extra_fields({"showResultsInDashboard": False}, {}, dict(RETEST_EXTRA_FIELDS))
+    report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
+    assert report["findings"] == []
+
+
 def test_get_project_graphql_error_is_502(client, stub):
     stub.routes = {"GetProject": FakeResponse(status_code=500, text="nope")}
     resp = call(client, "get", "/getProject?projectId=1")
@@ -607,8 +677,33 @@ def test_get_finding_summaries_returns_lean_findings(client, stub):
     assert first == {
         "id": 31, "reportId": 5, "title": "SQLi", "summary": "The search endpoint concatenates input.",
         "position": 1, "complete": True, "cvssScore": 9.1, "severity": "Critical", "severityWeight": 1,
+        "sourceFindingId": None, "retestVerdict": "",
     }
     assert second["summary"] == "" and second["severity"] is None and second["complete"] is False
+
+
+@pytest.mark.parametrize("source_finding_id, verdict, expected", [
+    (22, "still_present", (22, "still_present")),
+    ("22", None, (22, "")),  # integer field written as text; verdict not given yet
+    (None, None, (None, "")),
+    ("", 5, (None, "")),  # garbage reads as unset
+], ids=["copy-with-verdict", "copy-without-verdict", "not-a-copy", "garbage"])
+def test_get_finding_summaries_returns_retest_fields(client, stub, source_finding_id, verdict, expected):
+    payload = _summaries_payload({"showResultsInDashboard": True})
+    finding = payload["project"][0]["reports"][0]["findings"][0]
+    finding["sourceFindingId"] = source_finding_id
+    finding["retestVerdict"] = verdict
+    stub.routes = {"FindingSummaries": payload}
+    first = call(client, "get", "/getFindingSummaries?projectIds=1").get_json()["projects"][0]["findings"][0]
+    assert (first["sourceFindingId"], first["retestVerdict"]) == expected
+
+
+def test_get_finding_summaries_selects_only_the_retest_paths(client, stub):
+    stub.routes = {"FindingSummaries": _summaries_payload({"showResultsInDashboard": True})}
+    call(client, "get", "/getFindingSummaries?projectIds=1")
+    query = stub.queries_matching("FindingSummaries")[0]["query"]
+    assert 'sourceFindingId: extraFields(path: "source_finding_id")' in query
+    assert 'retestVerdict: extraFields(path: "retest_verdict")' in query
 
 
 def test_get_finding_summaries_selects_no_heavy_fields(client, stub):
@@ -723,12 +818,30 @@ ORIGINAL_PROJECT = {
     "project_by_pk": {
         "id": 1, "codename": "BLUE", "description": "d", "clientId": 9, "projectTypeId": 2,
         "startDate": "2026-01-01", "endDate": "2026-01-31", "timezone": "UTC",
-        "reports": [{"findings": [
-            {"id": 31, "title": "SQLi", "description": "orig", "severityId": 1},
+        "reports": [{"id": 5, "title": "Web application test report", "findings": [
+            {"id": 31, "title": "SQLi", "description": "orig", "severityId": 1,
+             "extraFields": {"mitigation_prompt": "keep", "poc": "keep"}},
             {"id": 32, "title": "XSS", "description": "orig2", "severityId": 2},
         ]}],
     }
 }
+
+
+def _project_with_retest_reports():
+    """ORIGINAL_PROJECT plus a "Retest" report (copies) and a legacy "Original Findings" one."""
+    project = copy.deepcopy(ORIGINAL_PROJECT)
+    project["project_by_pk"]["reports"] += [
+        {"id": 6, "title": "Retest", "findings": [
+            {"id": 41, "title": "SQLi", "description": "copy", "severityId": 1,
+             "extraFields": {"source_finding_id": 11, "source_project_id": 0,
+                             "retest_verdict": "still_present", "positive_control": "<p>x</p>",
+                             "retest_client_status": "Fixed", "retest_client_note": "<p>old</p>"}},
+        ]},
+        {"id": 7, "title": "Original Findings", "findings": [
+            {"id": 51, "title": "Old copy", "description": "legacy", "severityId": 1},
+        ]},
+    ]
+    return project
 
 
 def _retest_routes(project=None):
@@ -736,16 +849,27 @@ def _retest_routes(project=None):
         "GetProjectForRetest": project if project is not None else ORIGINAL_PROJECT,
         "insert_project_one": {"insert_project_one": {"id": 100}},
         "insert_report_one": {"insert_report_one": {"id": 200}},
-        "insert_reportedFinding": {"insert_reportedFinding": {
-            "affected_rows": 2, "returning": [{"id": 301}, {"id": 302}],
+        "insert_reportedFinding": lambda variables: {"insert_reportedFinding": {
+            "affected_rows": len(variables["objects"]),
+            "returning": [{"id": 301 + i} for i in range(len(variables["objects"]))],
         }},
         "uploadEvidence": {"uploadEvidence": {"id": 400}},
     }
 
 
+def _inserted_findings(stub):
+    return stub.variables_for("insert_reportedFinding")["objects"]
+
+
 def test_create_retest_requires_project_id(client):
     resp = call(client, "post", "/createRetest", {})
     assert resp.status_code == 400
+
+
+def test_create_retest_rejects_non_integer_project_id(client, stub):
+    resp = call(client, "post", "/createRetest", {"projectId": "abc"})
+    assert resp.status_code == 400
+    assert stub.calls == []
 
 
 def test_create_retest_missing_project_is_404(client, stub):
@@ -760,11 +884,16 @@ def test_create_retest_happy_path(client, stub):
     resp = call(client, "post", "/createRetest", {"projectId": 1})
     assert resp.status_code == 200
     assert resp.get_json() == {
+        "projectId": 100,
+        "reportId": 200,
+        "findingsCount": 2,
+        "findingIdMapping": {"31": 301, "32": 302},
+        "evidenceErrors": [],
+        # The pre-traceability names stay for old callers.
         "originalProjectId": 1,
         "newProjectId": 100,
         "newReportId": 200,
         "findingsCopied": 2,
-        "findingIdMapping": {"31": 301, "32": 302},
     }
 
 
@@ -774,28 +903,159 @@ def test_create_retest_names_and_scopes_the_copy(client, stub):
     new_project = stub.variables_for("insert_project_one")["object"]
     assert new_project["codename"] == "Retest - BLUE"
     assert new_project["clientId"] == 9
+    assert (new_project["startDate"], new_project["endDate"]) == ("2026-01-01", "2026-01-31")
     report = stub.variables_for("insert_report_one")["object"]
     assert report == {
-        "projectId": 100, "title": "Original Findings",
+        "projectId": 100, "title": "Retest",
         "creation": "2026-01-31", "last_update": "2026-01-31",
         "archived": False, "complete": False, "delivered": False,
         "include_bloodhound_data": False,
     }
-    findings = stub.variables_for("insert_reportedFinding")["objects"]
+    assert app_module.RETEST_REPORT_TITLE == "Retest"
+    findings = _inserted_findings(stub)
     assert [f["reportId"] for f in findings] == [200, 200]
     assert "id" not in findings[0], "original primary keys must not be copied"
 
 
-def test_create_retest_applies_comment_status_and_description(client, stub):
+def test_create_retest_applies_codename_and_date_overrides(client, stub):
+    stub.routes = _retest_routes()
+    call(client, "post", "/createRetest", {
+        "projectId": 1, "codename": "Retest - Web application test - 12 Jan 2027",
+        "startDate": "2027-01-12", "endDate": "2027-01-13",
+    })
+    new_project = stub.variables_for("insert_project_one")["object"]
+    assert new_project["codename"] == "Retest - Web application test - 12 Jan 2027"
+    assert (new_project["startDate"], new_project["endDate"]) == ("2027-01-12", "2027-01-13")
+    report = stub.variables_for("insert_report_one")["object"]
+    assert report["creation"] == report["last_update"] == "2027-01-13"
+
+
+@pytest.mark.parametrize("body", [
+    {"codename": ""}, {"startDate": 20270112}, {"endDate": "   "},
+], ids=["blank-codename", "numeric-date", "blank-date"])
+def test_create_retest_rejects_bad_overrides_before_any_call(client, stub, body):
+    resp = call(client, "post", "/createRetest", dict(body, projectId=1))
+    assert resp.status_code == 400
+    assert stub.calls == []
+
+
+def test_create_retest_copies_only_the_requested_findings(client, stub):
+    stub.routes = _retest_routes()
+    resp = call(client, "post", "/createRetest", {"projectId": 1, "findingIds": [32, "32"]})
+    assert resp.status_code == 200
+    findings = _inserted_findings(stub)
+    assert [f["title"] for f in findings] == ["XSS"], "duplicates are copied once"
+    payload = resp.get_json()
+    assert payload["findingIdMapping"] == {"32": 301}
+    assert payload["findingsCount"] == 1
+
+
+def test_create_retest_keeps_the_requested_order_in_the_mapping(client, stub):
+    stub.routes = _retest_routes()
+    resp = call(client, "post", "/createRetest", {"projectId": 1, "findingIds": [32, 31]})
+    assert [f["title"] for f in _inserted_findings(stub)] == ["XSS", "SQLi"]
+    assert resp.get_json()["findingIdMapping"] == {"32": 301, "31": 302}
+
+
+def test_create_retest_unknown_finding_id_is_400_and_creates_nothing(client, stub):
+    stub.routes = _retest_routes(_project_with_retest_reports())
+    # 51 is in the legacy "Original Findings" report, 999 does not exist.
+    resp = call(client, "post", "/createRetest", {"projectId": 1, "findingIds": [31, 999, 51]})
+    assert resp.status_code == 400
+    assert resp.get_json() == {"error": "unknown findingIds", "findingIds": [999, 51]}
+    assert stub.queries_matching("insert_project_one") == []
+    assert stub.queries_matching("insert_report_one") == []
+    assert stub.queries_matching("insert_reportedFinding") == []
+
+
+@pytest.mark.parametrize("finding_ids", [[], "31", [31, "x"], [True], {"a": 1}],
+                         ids=["empty", "string", "non-integer", "bool", "object"])
+def test_create_retest_rejects_malformed_finding_ids_before_any_call(client, stub, finding_ids):
+    resp = call(client, "post", "/createRetest", {"projectId": 1, "findingIds": finding_ids})
+    assert resp.status_code == 400
+    assert stub.calls == []
+
+
+def test_create_retest_without_finding_ids_skips_retest_reports(client, stub):
+    """By default only the project's own findings are copied, not earlier copies."""
+    stub.routes = _retest_routes(_project_with_retest_reports())
+    resp = call(client, "post", "/createRetest", {"projectId": 1})
+    assert [f["description"] for f in _inserted_findings(stub)] == ["orig", "orig2"]
+    assert resp.get_json()["findingIdMapping"] == {"31": 301, "32": 302}
+    query = stub.queries_matching("GetProjectForRetest")[0]["query"]
+    assert "title" in query, "the report title decides which findings are copies"
+
+
+def test_create_retest_of_a_retest_copies_a_copy_asked_for_by_id(client, stub):
+    stub.routes = _retest_routes(_project_with_retest_reports())
+    resp = call(client, "post", "/createRetest", {"projectId": 1, "findingIds": [41]})
+    assert resp.status_code == 200
+    (copy_,) = _inserted_findings(stub)
+    # The new copy points at the copy it was made from, and starts without a verdict.
+    assert copy_["extraFields"] == {
+        "source_finding_id": 41, "source_project_id": 1,
+        "retest_client_status": "", "retest_client_note": "",
+        "retest_verdict": "", "positive_control": "",
+    }
+    assert resp.get_json()["findingIdMapping"] == {"41": 301}
+
+
+def test_create_retest_sets_and_resets_the_extra_fields(client, stub):
+    project = copy.deepcopy(ORIGINAL_PROJECT)
+    project["project_by_pk"]["reports"][0]["findings"][0]["extraFields"].update({
+        "retest_verdict": "fixed", "positive_control": "<p>old</p>", "source_finding_id": 7,
+    })
+    stub.routes = _retest_routes(project)
+    call(client, "post", "/createRetest", {
+        "projectId": 1,
+        "comments": [{"findingId": 31, "status": "Fixed", "description": "Patched in 2.4 <b>&</b> deployed\nyesterday"}],
+    })
+    first, second = _inserted_findings(stub)
+    assert first["extraFields"] == {
+        "mitigation_prompt": "keep", "poc": "keep",  # the original's extra fields are kept
+        "source_finding_id": 31,
+        "source_project_id": 1,
+        "retest_client_status": "Fixed",
+        "retest_client_note": "<p>Patched in 2.4 &lt;b&gt;&amp;&lt;/b&gt; deployed<br>yesterday</p>",
+        "retest_verdict": "",
+        "positive_control": "",
+    }
+    assert second["extraFields"] == {
+        "source_finding_id": 32, "source_project_id": 1,
+        "retest_client_status": "", "retest_client_note": "",
+        "retest_verdict": "", "positive_control": "",
+    }
+    # The source finding is not changed by building the copy.
+    assert project["project_by_pk"]["reports"][0]["findings"][0]["extraFields"]["retest_verdict"] == "fixed"
+
+
+def test_create_retest_leaves_title_and_description_unchanged(client, stub):
+    """The customer's comment goes to extra fields; no title prefix, no appended text."""
     stub.routes = _retest_routes()
     call(client, "post", "/createRetest", {
         "projectId": 1,
         "comments": [{"findingId": 31, "status": "RESOLVED", "description": "<p>fixed</p>"}],
     })
-    findings = stub.variables_for("insert_reportedFinding")["objects"]
-    assert findings[0]["title"] == "RESOLVED - SQLi"
-    assert "Retest Comment" in findings[0]["description"]
-    assert findings[1]["title"] == "XSS", "untouched findings keep their title"
+    first, second = _inserted_findings(stub)
+    assert (first["title"], first["description"]) == ("SQLi", "orig")
+    assert (second["title"], second["description"]) == ("XSS", "orig2")
+    assert first["extraFields"]["retest_client_status"] == "RESOLVED"
+    assert first["extraFields"]["retest_client_note"] == "<p>&lt;p&gt;fixed&lt;/p&gt;</p>"
+
+
+def test_create_retest_joins_several_comments_on_one_finding(client, stub):
+    stub.routes = _retest_routes()
+    call(client, "post", "/createRetest", {
+        "projectId": 1,
+        "comments": [
+            {"findingId": 31, "status": "Mitigated", "description": "first"},
+            {"findingId": "31", "status": "Fixed", "description": "second"},
+            {"findingId": 31, "status": "", "description": ""},
+        ],
+    })
+    extra = _inserted_findings(stub)[0]["extraFields"]
+    assert extra["retest_client_status"] == "Fixed", "the last status given wins"
+    assert extra["retest_client_note"] == "<p>first</p><p>second</p>"
 
 
 def test_create_retest_uploads_evidence_to_the_report(client, stub):
@@ -824,11 +1084,27 @@ def test_create_retest_reports_unmatched_evidence(client, stub):
     assert stub.queries_matching("uploadEvidence") == []
 
 
+def test_create_retest_reports_evidence_for_a_finding_left_out(client, stub):
+    """Evidence on a comment for a finding not in findingIds has no copy to go with."""
+    stub.routes = _retest_routes()
+    resp = call(client, "post", "/createRetest", {
+        "projectId": 1, "findingIds": [32],
+        "comments": [{"findingId": 31, "evidence_b64": "eA=="}],
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()["evidenceErrors"] == [
+        {"originalFindingId": 31, "error": "no matching new finding found"},
+    ]
+    assert stub.queries_matching("uploadEvidence") == []
+
+
 def test_create_retest_with_no_findings_skips_insert(client, stub):
     stub.routes = _retest_routes({"project_by_pk": dict(ORIGINAL_PROJECT["project_by_pk"], reports=[])})
     resp = call(client, "post", "/createRetest", {"projectId": 1})
     assert resp.status_code == 200
     assert resp.get_json()["findingsCopied"] == 0
+    assert resp.get_json()["findingsCount"] == 0
+    assert resp.get_json()["findingIdMapping"] == {}
     assert stub.queries_matching("insert_reportedFinding") == []
 
 
