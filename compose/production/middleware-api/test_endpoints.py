@@ -579,6 +579,34 @@ def test_get_project_retest_is_null_without_a_source_finding(client, stub, findi
     assert "retest_verdict" not in (finding["extraFields"] or {})
 
 
+def test_get_project_retest_block_survives_an_edited_copy(client, stub):
+    """
+    Ghostwriter's editor keeps only extra fields that have a spec. A copy in a "Retest" report
+    whose unspecified source_finding_id was dropped by an edit still carries its verdict.
+    """
+    routes = _project_with_extra_fields(
+        {"showResultsInDashboard": True}, {},
+        {"retest_verdict": "still-present", "positive_control": "<p>Still fires.</p>", "poc": "keep"},
+    )
+    routes["GetProject"]["project_by_pk"]["reports"][0]["title"] = "Retest"
+    stub.routes = routes
+    finding = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]["findings"][0]
+    assert finding["retest"] == {
+        "sourceFindingId": None, "sourceProjectId": None, "verdict": "still-present",
+        "positiveControl": "<p>Still fires.</p>", "clientStatus": "", "clientNote": "",
+    }
+    assert finding["extraFields"] == {"poc": "keep"}
+
+
+def test_get_project_retest_block_needs_a_source_outside_a_retest_report(client, stub):
+    """Outside a "Retest" report a verdict alone does not make a finding a copy."""
+    stub.routes = _project_with_extra_fields(
+        {"showResultsInDashboard": True}, {}, {"retest_verdict": "fixed"},
+    )
+    finding = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]["findings"][0]
+    assert finding["retest"] is None
+
+
 def test_get_project_returns_the_retest_report(client, stub):
     """The query hides only the legacy "Original Findings" report, so "Retest" comes back."""
     stub.routes = _get_project_routes({"showResultsInDashboard": True})
