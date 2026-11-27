@@ -18,6 +18,7 @@ Run from this directory:
 """
 import base64
 import copy
+import json
 import os
 
 import pytest
@@ -485,8 +486,9 @@ def test_get_project_lifts_mitigation_prompt_and_c4_model(client, stub):
     assert report["c4Model"] == C4_MODEL
     assert report["findings"][0]["mitigationPrompt"] == "# Fix: SQLi\n\nUse bound parameters."
     # Carried once: the raw copies leave extraFields, everything else stays.
-    assert report["extraFields"] == {"other": "keep"}
-    assert report["findings"][0]["extraFields"] == {"poc": "keep"}
+    # No raw extra fields leave Ghostwriter: a field not on the allow-list is dropped.
+    assert "extraFields" not in report
+    assert "extraFields" not in report["findings"][0]
 
 
 @pytest.mark.parametrize("report_extra,finding_extra", [
@@ -521,7 +523,7 @@ def test_get_project_hides_c4_model_when_flag_not_true(client, stub):
     )
     report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
     assert report["c4Model"] is None
-    assert "c4_model" not in report["extraFields"]
+    assert "extraFields" not in report and report["facts"] is None
     assert report["findings"] == []
 
 
@@ -548,8 +550,7 @@ def test_get_project_lifts_the_retest_block(client, stub):
         "clientStatus": "Fixed",
         "clientNote": "<p>Patched in 2.4</p>",
     }
-    # Carried once: the six raw fields leave extraFields, everything else stays.
-    assert finding["extraFields"] == {"poc": "keep"}
+    assert "extraFields" not in finding
 
 
 def test_get_project_retest_block_defaults_unset_values(client, stub):
@@ -562,7 +563,7 @@ def test_get_project_retest_block_defaults_unset_values(client, stub):
         "sourceFindingId": 22, "sourceProjectId": None, "verdict": "", "positiveControl": "",
         "clientStatus": "", "clientNote": "",
     }
-    assert finding["extraFields"] == {}
+    assert "extraFields" not in finding
 
 
 @pytest.mark.parametrize("finding_extra", [
@@ -576,7 +577,7 @@ def test_get_project_retest_is_null_without_a_source_finding(client, stub, findi
     stub.routes = _project_with_extra_fields({"showResultsInDashboard": True}, {}, finding_extra)
     finding = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]["findings"][0]
     assert finding["retest"] is None
-    assert "retest_verdict" not in (finding["extraFields"] or {})
+    assert "extraFields" not in finding
 
 
 def test_get_project_retest_block_survives_an_edited_copy(client, stub):
@@ -595,7 +596,7 @@ def test_get_project_retest_block_survives_an_edited_copy(client, stub):
         "sourceFindingId": None, "sourceProjectId": None, "verdict": "still-present",
         "positiveControl": "<p>Still fires.</p>", "clientStatus": "", "clientNote": "",
     }
-    assert finding["extraFields"] == {"poc": "keep"}
+    assert "extraFields" not in finding
 
 
 def test_get_project_retest_block_needs_a_source_outside_a_retest_report(client, stub):
@@ -705,7 +706,7 @@ def test_get_finding_summaries_returns_lean_findings(client, stub):
     assert first == {
         "id": 31, "reportId": 5, "title": "SQLi", "summary": "The search endpoint concatenates input.",
         "position": 1, "complete": True, "cvssScore": 9.1, "severity": "Critical", "severityWeight": 1,
-        "sourceFindingId": None, "retestVerdict": "",
+        "sourceFindingId": None, "retestVerdict": "", "confidence": "",
     }
     assert second["summary"] == "" and second["severity"] is None and second["complete"] is False
 
@@ -1311,3 +1312,70 @@ def test_graphql_request_surfaces_non_json_body(client, monkeypatch):
     resp = call(client, "get", "/getClient?clientId=1")
     assert resp.status_code == 502
     assert "decode failed" in resp.get_json()["error"]["message"]
+
+
+# ---- Client-facing details and facts: an allow-list -----------------------------------------
+
+def test_get_project_details_keep_only_allow_listed_keys_and_scalars(client, stub):
+    stub.routes = _project_with_extra_fields({"showResultsInDashboard": True}, {}, {
+        "confidence": " Confirmed ",
+        "occurrences": [
+            {"operation": "GET /a", "request": "raw/x.txt", "absorbed_id": "F-9", "nested": {"a": 1}},
+            {"request": "raw/only-internal.txt"},  # nothing client-facing left: dropped
+            "not an object",
+        ],
+        "attack_chain": '[{"step": 1, "claim": "c", "basis": "measured", "evidence": "raw/y.txt"}]',
+        "wstg": ["WSTG-INPV-05", "", None, 4],
+        "prior_identifiers": "NN-1",  # not a list
+        "oracle_result": "pass", "quantity_provenance": "<p>wc -l</p>",
+        "evidence_contains_live_secrets": "yes",  # only a real true counts
+    })
+    finding = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]["findings"][0]
+    d = finding["details"]
+    assert d["confidence"] == "Confirmed"
+    assert d["occurrences"] == [{"operation": "GET /a"}]
+    assert d["attackChain"] == [{"step": 1, "claim": "c", "basis": "measured"}]
+    assert d["classification"]["wstg"] == ["WSTG-INPV-05", "4"]
+    assert d["priorIdentifiers"] == [] and d["evidenceContainsLiveSecrets"] is False
+    body = json.dumps(finding)
+    assert "raw/" not in body and "oracle_result" not in body and "\"pass\"" not in body and "wc -l" not in body
+
+
+def test_get_project_details_default_when_unset(client, stub):
+    stub.routes = _project_with_extra_fields({"showResultsInDashboard": True}, None, None)
+    report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
+    d = report["findings"][0]["details"]
+    assert d["confidence"] == "" and d["occurrences"] == [] and d["classification"]["cweId"] == ""
+    assert report["facts"]["testDataLog"] == [] and report["facts"]["version"] == ""
+
+
+def test_get_project_report_facts_drop_internal_fields(client, stub):
+    stub.routes = _project_with_extra_fields({"showResultsInDashboard": True}, {
+        "version": "1.2", "qa_signoff": "A. Reviewer", "client_feedback": [{"item": "x"}],
+        "test_data_log": [{"object": "doc-1", "state": "present", "session": "testing", "account": "a"}],
+        "limitations": ["brute force"],
+    }, {})
+    report = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]["reports"][0]
+    assert report["facts"]["version"] == "1.2"
+    assert report["facts"]["testDataLog"] == [{"object": "doc-1", "state": "present", "account": "a"}]
+    assert report["facts"]["limitations"] == ["brute force"]
+    assert "A. Reviewer" not in json.dumps(report) and "client_feedback" not in json.dumps(report)
+
+
+def test_get_project_drops_project_and_client_extra_fields(client, stub):
+    payload = _project_payload({"showResultsInDashboard": True, "internal": "x"})
+    payload["project_by_pk"]["extraFields"] = {"test_accounts": [{"password": "s3cret"}]}
+    stub.routes = {"GetProject": payload, "downloadEvidence": _get_project_routes({})["downloadEvidence"]}
+    project = call(client, "get", "/getProject?projectId=1").get_json()["project_by_pk"]
+    assert "extraFields" not in project and "extraFields" not in project["client"]
+    assert project["reports"][0]["findings"], "the results flag is still read before it is dropped"
+
+
+def test_get_finding_summaries_returns_confidence(client, stub):
+    payload = _summaries_payload({"showResultsInDashboard": True})
+    payload["project"][0]["reports"][0]["findings"][0]["confidence"] = "Tentative"
+    stub.routes = {"FindingSummaries": payload}
+    first = call(client, "get", "/getFindingSummaries?projectIds=1").get_json()["projects"][0]["findings"][0]
+    assert first["confidence"] == "Tentative"
+    query = stub.queries_matching("FindingSummaries")[0]["query"]
+    assert 'confidence: extraFields(path: "confidence")' in query
